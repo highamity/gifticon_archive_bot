@@ -17,6 +17,7 @@ class Gifticon:
     status: str
     used_by: str | None
     used_at: str | None
+    expiry_date: str | None
 
 
 class GifticonStore:
@@ -49,26 +50,44 @@ class GifticonStore:
                     )
                     """
                 )
+                columns = {row[1] for row in conn.execute("PRAGMA table_info(gifticons)")}
+                if "expiry_date" not in columns:
+                    conn.execute("ALTER TABLE gifticons ADD COLUMN expiry_date TEXT")
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS expiry_notifications (
+                        source_message_id INTEGER NOT NULL,
+                        notice_date TEXT NOT NULL,
+                        PRIMARY KEY (source_message_id, notice_date)
+                    )
+                    """
+                )
                 conn.commit()
             finally:
                 conn.close()
 
-    async def add(self, source_id: int, archive_id: int, description: str) -> None:
-        await asyncio.to_thread(self._add_sync, source_id, archive_id, description)
+    async def add(
+        self, source_id: int, archive_id: int, description: str, expiry_date: str | None = None
+    ) -> None:
+        await asyncio.to_thread(self._add_sync, source_id, archive_id, description, expiry_date)
 
-    def _add_sync(self, source_id: int, archive_id: int, description: str) -> None:
+    def _add_sync(
+        self, source_id: int, archive_id: int, description: str, expiry_date: str | None
+    ) -> None:
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute(
                     """
-                    INSERT INTO gifticons (source_message_id, archive_message_id, description)
-                    VALUES (?, ?, ?)
+                    INSERT INTO gifticons
+                        (source_message_id, archive_message_id, description, expiry_date)
+                    VALUES (?, ?, ?, ?)
                     ON CONFLICT(source_message_id) DO UPDATE SET
                         archive_message_id = excluded.archive_message_id,
-                        description = excluded.description
+                        description = excluded.description,
+                        expiry_date = excluded.expiry_date
                     """,
-                    (source_id, archive_id, description),
+                    (source_id, archive_id, description, expiry_date),
                 )
                 conn.commit()
             finally:
@@ -122,6 +141,33 @@ class GifticonStore:
             finally:
                 conn.close()
 
+    async def delete(self, source_id: int) -> bool:
+        return await asyncio.to_thread(self._delete_sync, source_id)
+
+    def _delete_sync(self, source_id: int) -> bool:
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute("DELETE FROM gifticons WHERE source_message_id = ?", (source_id,))
+                conn.commit()
+                return cur.rowcount == 1
+            finally:
+                conn.close()
+
+    async def clear(self) -> int:
+        return await asyncio.to_thread(self._clear_sync)
+
+    def _clear_sync(self) -> int:
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute("DELETE FROM gifticons")
+                conn.execute("DELETE FROM expiry_notifications")
+                conn.commit()
+                return cur.rowcount
+            finally:
+                conn.close()
+
     async def restore(self, source_id: int, new_source_id: int) -> None:
         await asyncio.to_thread(self._restore_sync, source_id, new_source_id)
 
@@ -164,6 +210,25 @@ class GifticonStore:
                 conn.close()
         return [self._row_to_gifticon(row) for row in rows if row]
 
+    async def claim_expiry_notification(self, source_id: int, notice_date: str) -> bool:
+        return await asyncio.to_thread(self._claim_expiry_notification_sync, source_id, notice_date)
+
+    def _claim_expiry_notification_sync(self, source_id: int, notice_date: str) -> bool:
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    """
+                    INSERT OR IGNORE INTO expiry_notifications (source_message_id, notice_date)
+                    VALUES (?, ?)
+                    """,
+                    (source_id, notice_date),
+                )
+                conn.commit()
+                return cur.rowcount == 1
+            finally:
+                conn.close()
+
     @staticmethod
     def _row_to_gifticon(row: sqlite3.Row | None) -> Gifticon | None:
         if row is None:
@@ -175,4 +240,5 @@ class GifticonStore:
             status=str(row["status"]),
             used_by=str(row["used_by"]) if row["used_by"] else None,
             used_at=str(row["used_at"]) if row["used_at"] else None,
+            expiry_date=str(row["expiry_date"]) if row["expiry_date"] else None,
         )
