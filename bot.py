@@ -30,6 +30,7 @@ OCR_MAX_FILE_BYTES = 10 * 1024 * 1024
 OCR_MAX_PIXELS = 20_000_000
 OCR_MAX_DIMENSION = 2000
 OCR_TIMEOUT_SECONDS = 15
+NOTIFICATION_JOB_NAME = "daily-expiry-notice"
 # Telegram albums arrive as several updates.  Keep the complete archive
 # transaction (copy -> download/OCR -> DB -> acknowledgement) serialized so
 # concurrent album updates cannot interfere with one another.
@@ -342,6 +343,10 @@ async def on_management_message(update: Update, context: ContextTypes.DEFAULT_TY
         await show_list(msg, "used")
     elif command == "!사용완료삭제":
         await delete_used_all(msg, chat.id, argument, context)
+    elif command == "!알림설정":
+        await update_notification_settings(msg, chat.id, argument, context)
+    elif command == "!알림테스트":
+        await test_expiry_notification(msg, chat.id, argument, context)
     elif command == "!검색":
         if not argument:
             await msg.reply_text("사용법: !검색 <단어>")
@@ -877,25 +882,152 @@ async def show_expiring(msg, days: int, include_expired: bool) -> None:
     await msg.reply_text("\n".join(lines))
 
 
-async def notify_expiring(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Notify the normal use room once daily about gifts expiring within 7 days."""
+async def notify_expiring(context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Notify the normal use room once daily about gifts expiring soon."""
+    settings = await STORE.get_notification_settings()
+    if not settings.enabled:
+        return 0
+    return await _send_expiry_notification(context, settings.days, claim=True)
+
+
+async def _send_expiry_notification(
+    context: ContextTypes.DEFAULT_TYPE, days: int, claim: bool
+) -> int:
+    """Send an expiry notice and return the number of included gifticons."""
     today = datetime.now(ZoneInfo("Asia/Seoul")).date()
-    cutoff = today + timedelta(days=7)
+    cutoff = today + timedelta(days=days)
     records = await STORE.list(status="available")
     matches = []
     for item in records:
         expiry = date.fromisoformat(item.expiry_date) if item.expiry_date else expiry_from_text(item.description)
         if expiry and today <= expiry <= cutoff:
-            if await STORE.claim_expiry_notification(item.source_message_id, today.isoformat()):
+            if not claim or await STORE.claim_expiry_notification(item.source_message_id, today.isoformat()):
                 matches.append((item, expiry))
     if not matches:
-        return
+        return 0
     matches.sort(key=lambda pair: pair[1])
-    lines = ["⚠️ 유효기간 임박 기프티콘 알림", "7일 이내 만료 예정인 미사용 기프티콘입니다."]
+    lines = [
+        "⚠️ 유효기간 임박 기프티콘 알림",
+        f"{days}일 이내 만료 예정인 미사용 기프티콘입니다.",
+    ]
     for item, expiry in matches[:50]:
         remaining = (expiry - today).days
         lines.append(f"- {gifticon_summary(item.description, expiry, item.title)} ({remaining}일 남음)")
     await context.bot.send_message(ACTIVE_CHAT_ID, "\n".join(lines))
+    return len(matches)
+
+
+def parse_notification_time(value: str) -> time | None:
+    try:
+        parsed = datetime.strptime(value.strip(), "%H:%M").time()
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+
+
+async def schedule_expiry_job(job_queue) -> None:
+    """Replace the daily job using the persisted notification settings."""
+    for job in job_queue.get_jobs_by_name(NOTIFICATION_JOB_NAME):
+        job.schedule_removal()
+    settings = await STORE.get_notification_settings()
+    if settings.enabled:
+        send_time = parse_notification_time(settings.send_time)
+        if send_time is None:
+            logger.error("Invalid persisted notification time: %s", settings.send_time)
+            return
+        job_queue.run_daily(notify_expiring, time=send_time, name=NOTIFICATION_JOB_NAME)
+
+
+async def load_expiry_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await schedule_expiry_job(context.application.job_queue)
+
+
+async def update_notification_settings(
+    msg, chat_id: int, argument: str, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Show or update the persisted expiry-notification settings."""
+    if chat_id != ARCHIVE_CHAT_ID:
+        await msg.reply_text("알림 설정은 이력 방에서만 변경할 수 있습니다.")
+        return
+
+    settings = await STORE.get_notification_settings()
+    value = argument.strip()
+    if not value:
+        state = "켜짐" if settings.enabled else "꺼짐"
+        await msg.reply_text(
+            f"유효기간 알림: {state}\n"
+            f"기준 기간: {settings.days}일 이내\n"
+            f"발송 시각: 매일 {settings.send_time} (KST)\n\n"
+            "변경: !알림설정 7일 09:00\n"
+            "끄기: !알림설정 끄기 / 켜기: !알림설정 켜기"
+        )
+        return
+
+    if value in {"끄기", "off", "disable"}:
+        await STORE.set_notification_settings(False, settings.days, settings.send_time)
+        await schedule_expiry_job(context.application.job_queue)
+        await msg.reply_text("유효기간 알림을 껐습니다.")
+        return
+
+    if value in {"켜기", "on", "enable"}:
+        await STORE.set_notification_settings(True, settings.days, settings.send_time)
+        await schedule_expiry_job(context.application.job_queue)
+        await msg.reply_text(
+            f"유효기간 알림을 켰습니다. 매일 {settings.send_time} (KST), "
+            f"{settings.days}일 이내 기준입니다."
+        )
+        return
+
+    parts = value.split()
+    days = settings.days
+    send_time = settings.send_time
+    for part in parts:
+        if re.fullmatch(r"\d+일?", part):
+            days = int(part.rstrip("일"))
+        elif re.fullmatch(r"\d{1,2}:\d{2}", part):
+            if parse_notification_time(part) is None:
+                await msg.reply_text("발송 시각은 00:00부터 23:59까지 입력하세요.")
+                return
+            send_time = part
+        else:
+            await msg.reply_text(
+                "사용법: !알림설정 [7일] [09:00]\n"
+                "예: !알림설정 7일 08:30\n"
+                "끄기/켜기: !알림설정 끄기 또는 !알림설정 켜기"
+            )
+            return
+    if days < 0 or days > 3650:
+        await msg.reply_text("알림 기간은 0일부터 3650일까지 입력하세요.")
+        return
+    await STORE.set_notification_settings(True, days, send_time)
+    await schedule_expiry_job(context.application.job_queue)
+    await msg.reply_text(
+        f"유효기간 알림을 저장했습니다. 매일 {send_time} (KST), {days}일 이내 기준입니다."
+    )
+
+
+async def test_expiry_notification(
+    msg, chat_id: int, argument: str, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Send a real-looking test notice without consuming today's daily claim."""
+    if chat_id != ARCHIVE_CHAT_ID:
+        await msg.reply_text("알림 테스트는 이력 방에서만 실행할 수 있습니다.")
+        return
+    settings = await STORE.get_notification_settings()
+    days = settings.days
+    if argument:
+        if not re.fullmatch(r"\d+", argument):
+            await msg.reply_text("사용법: !알림테스트 또는 !알림테스트 7")
+            return
+        days = int(argument)
+    if days < 0 or days > 3650:
+        await msg.reply_text("테스트 기간은 0일부터 3650일까지 입력하세요.")
+        return
+    count = await _send_expiry_notification(context, days, claim=False)
+    if count:
+        await msg.reply_text(f"알림 테스트를 보냈습니다. 대상 쿠폰: {count}개")
+    else:
+        await msg.reply_text(f"{days}일 이내 만료 예정인 미사용 쿠폰이 없습니다.")
 
 
 def main() -> None:
@@ -910,11 +1042,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(confirm_use))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_management_message), group=0)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, archive_message), group=1)
-    app.job_queue.run_daily(
-        notify_expiring,
-        time=time(hour=9, minute=0, tzinfo=ZoneInfo("Asia/Seoul")),
-        name="daily-expiry-notice",
-    )
+    app.job_queue.run_once(load_expiry_job, when=0, name="load-expiry-notice-settings")
     logger.info("Polling started for active=%s archive=%s", ACTIVE_CHAT_ID, ARCHIVE_CHAT_ID)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 

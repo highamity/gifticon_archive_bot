@@ -21,6 +21,13 @@ class Gifticon:
     expiry_date: str | None
 
 
+@dataclass(frozen=True)
+class NotificationSettings:
+    enabled: bool
+    days: int
+    send_time: str
+
+
 class GifticonStore:
     def __init__(self, db_path: Path) -> None:
         self._path = db_path
@@ -64,6 +71,22 @@ class GifticonStore:
                         notice_date TEXT NOT NULL,
                         PRIMARY KEY (source_message_id, notice_date)
                     )
+                    """
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS notification_settings (
+                        id INTEGER PRIMARY KEY CHECK(id = 1),
+                        enabled INTEGER NOT NULL DEFAULT 1,
+                        days INTEGER NOT NULL DEFAULT 7,
+                        send_time TEXT NOT NULL DEFAULT '09:00'
+                    )
+                    """
+                )
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO notification_settings (id, enabled, days, send_time)
+                    VALUES (1, 1, 7, '09:00')
                     """
                 )
                 conn.commit()
@@ -294,6 +317,54 @@ class GifticonStore:
                 )
                 conn.commit()
                 return cur.rowcount == 1
+            finally:
+                conn.close()
+
+    async def get_notification_settings(self) -> NotificationSettings:
+        return await asyncio.to_thread(self._get_notification_settings_sync)
+
+    def _get_notification_settings_sync(self) -> NotificationSettings:
+        with self._lock:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT enabled, days, send_time FROM notification_settings WHERE id = 1"
+                ).fetchone()
+            finally:
+                conn.close()
+        if row is None:
+            return NotificationSettings(enabled=True, days=7, send_time="09:00")
+        return NotificationSettings(
+            enabled=bool(row["enabled"]),
+            days=int(row["days"]),
+            send_time=str(row["send_time"]),
+        )
+
+    async def set_notification_settings(
+        self, enabled: bool, days: int, send_time: str
+    ) -> None:
+        await asyncio.to_thread(
+            self._set_notification_settings_sync, enabled, days, send_time
+        )
+
+    def _set_notification_settings_sync(
+        self, enabled: bool, days: int, send_time: str
+    ) -> None:
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO notification_settings (id, enabled, days, send_time)
+                    VALUES (1, ?, ?, ?)
+                    ON CONFLICT(id) DO UPDATE SET
+                        enabled = excluded.enabled,
+                        days = excluded.days,
+                        send_time = excluded.send_time
+                    """,
+                    (int(enabled), days, send_time),
+                )
+                conn.commit()
             finally:
                 conn.close()
 

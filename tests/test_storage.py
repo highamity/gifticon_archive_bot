@@ -36,6 +36,16 @@ class GifticonStoreTests(unittest.TestCase):
                 self.assertEqual((await store.get_by_source(11)).status, "available")
                 self.assertEqual(len(await store.list(query="스타")), 1)
 
+                settings = await store.get_notification_settings()
+                self.assertTrue(settings.enabled)
+                self.assertEqual(settings.days, 7)
+                self.assertEqual(settings.send_time, "09:00")
+                await store.set_notification_settings(False, 14, "08:30")
+                settings = await store.get_notification_settings()
+                self.assertFalse(settings.enabled)
+                self.assertEqual(settings.days, 14)
+                self.assertEqual(settings.send_time, "08:30")
+
             asyncio.run(scenario())
 
 
