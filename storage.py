@@ -14,6 +14,7 @@ class Gifticon:
     source_message_id: int
     archive_message_id: int
     description: str
+    title: str | None
     status: str
     used_by: str | None
     used_at: str | None
@@ -42,6 +43,7 @@ class GifticonStore:
                         source_message_id INTEGER PRIMARY KEY,
                         archive_message_id INTEGER NOT NULL,
                         description TEXT NOT NULL DEFAULT '',
+                        title TEXT,
                         status TEXT NOT NULL DEFAULT 'available'
                             CHECK(status IN ('available', 'used')),
                         used_by TEXT,
@@ -53,6 +55,8 @@ class GifticonStore:
                 columns = {row[1] for row in conn.execute("PRAGMA table_info(gifticons)")}
                 if "expiry_date" not in columns:
                     conn.execute("ALTER TABLE gifticons ADD COLUMN expiry_date TEXT")
+                if "title" not in columns:
+                    conn.execute("ALTER TABLE gifticons ADD COLUMN title TEXT")
                 conn.execute(
                     """
                     CREATE TABLE IF NOT EXISTS expiry_notifications (
@@ -154,6 +158,70 @@ class GifticonStore:
             finally:
                 conn.close()
 
+    async def set_expiry(self, source_id: int, expiry_date: str | None) -> bool:
+        return await asyncio.to_thread(self._set_expiry_sync, source_id, expiry_date)
+
+    def _set_expiry_sync(self, source_id: int, expiry_date: str | None) -> bool:
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    "UPDATE gifticons SET expiry_date = ? WHERE source_message_id = ?",
+                    (expiry_date, source_id),
+                )
+                if cur.rowcount == 1:
+                    conn.execute(
+                        "DELETE FROM expiry_notifications WHERE source_message_id = ?",
+                        (source_id,),
+                    )
+                conn.commit()
+                return cur.rowcount == 1
+            finally:
+                conn.close()
+
+    async def set_title(self, source_id: int, title: str | None) -> bool:
+        return await asyncio.to_thread(self._set_title_sync, source_id, title)
+
+    def _set_title_sync(self, source_id: int, title: str | None) -> bool:
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    "UPDATE gifticons SET title = ? WHERE source_message_id = ?",
+                    (title, source_id),
+                )
+                conn.commit()
+                return cur.rowcount == 1
+            finally:
+                conn.close()
+
+    async def set_title_and_expiry(
+        self, source_id: int, title: str | None, expiry_date: str | None
+    ) -> bool:
+        return await asyncio.to_thread(
+            self._set_title_and_expiry_sync, source_id, title, expiry_date
+        )
+
+    def _set_title_and_expiry_sync(
+        self, source_id: int, title: str | None, expiry_date: str | None
+    ) -> bool:
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute(
+                    "UPDATE gifticons SET title = ?, expiry_date = ? WHERE source_message_id = ?",
+                    (title, expiry_date, source_id),
+                )
+                if cur.rowcount == 1:
+                    conn.execute(
+                        "DELETE FROM expiry_notifications WHERE source_message_id = ?",
+                        (source_id,),
+                    )
+                conn.commit()
+                return cur.rowcount == 1
+            finally:
+                conn.close()
+
     async def clear(self) -> int:
         return await asyncio.to_thread(self._clear_sync)
 
@@ -237,6 +305,7 @@ class GifticonStore:
             source_message_id=int(row["source_message_id"]),
             archive_message_id=int(row["archive_message_id"]),
             description=str(row["description"]),
+            title=str(row["title"]) if row["title"] else None,
             status=str(row["status"]),
             used_by=str(row["used_by"]) if row["used_by"] else None,
             used_at=str(row["used_at"]) if row["used_at"] else None,
