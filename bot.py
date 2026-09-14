@@ -51,6 +51,7 @@ def configured_chat_id(name: str) -> int:
 
 ACTIVE_CHAT_ID = configured_chat_id("GIFTICON_ACTIVE_CHAT_ID")
 ARCHIVE_CHAT_ID = configured_chat_id("GIFTICON_ARCHIVE_CHAT_ID")
+KST = ZoneInfo("Asia/Seoul")
 
 
 def description_for(message) -> str:
@@ -108,13 +109,51 @@ def parse_manual_expiry(value: str) -> date | None:
         year, month, day = map(int, full_date.groups())
     elif short_date:
         month, day = map(int, short_date.groups())
-        year = datetime.now(ZoneInfo("Asia/Seoul")).year
+        year = datetime.now(KST).year
     else:
         return None
     try:
         return date(year, month, day)
     except ValueError:
         return None
+
+
+def gifticon_expiry(gifticon: Gifticon) -> date | None:
+    """Return the saved expiry date, falling back to legacy OCR-only records."""
+    return (
+        date.fromisoformat(gifticon.expiry_date)
+        if gifticon.expiry_date
+        else expiry_from_text(gifticon.description)
+    )
+
+
+def kst_today() -> date:
+    return datetime.now(KST).date()
+
+
+def gifticon_label(gifticon: Gifticon) -> str:
+    return gifticon_summary(
+        gifticon.description, gifticon_expiry(gifticon), gifticon.title
+    )
+
+
+def telegram_message_link(chat_id: int, message_id: int) -> str | None:
+    """Build a Telegram message link for a private supergroup/channel."""
+    chat_id_text = str(chat_id)
+    if not chat_id_text.startswith("-100"):
+        return None
+    return f"https://t.me/c/{chat_id_text[4:]}/{message_id}"
+
+
+def gifticon_open_button(gifticon: Gifticon, index: int) -> InlineKeyboardButton | None:
+    target_chat_id = ACTIVE_CHAT_ID if gifticon.status == "available" else ARCHIVE_CHAT_ID
+    target_message_id = (
+        gifticon.source_message_id
+        if gifticon.status == "available"
+        else gifticon.archive_message_id
+    )
+    url = telegram_message_link(target_chat_id, target_message_id)
+    return InlineKeyboardButton(f"{index}번 기프티콘 열기", url=url) if url else None
 
 
 def gifticon_summary(text: str, expiry: date | None = None, title: str | None = None) -> str:
@@ -250,6 +289,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "이력 방의 보관본에 답장: !복구\n"
             "!목록 / !검색 <단어> / !사용완료\n"
             "!임박 [일수] / !만료 / !강제삭제 / !사용완료삭제 확인 / !초기화 확인\n\n"
+            "목록·검색·임박 알림의 '기프티콘 열기' 버튼을 누르면 원본 메시지로 이동합니다.\n"
+            "기본 목록과 검색에는 만료된 기프티콘이 표시되지 않으며, !만료에서 확인할 수 있습니다.\n\n"
             "기프티콘에 답장해 유효기간 YYYY-MM-DD 또는 M/D 입력: 유효기간 수정\n\n"
             "기프티콘에 답장해 제목 새 제목 입력: 목록 제목 수정\n\n"
             "관리용 명령은 사용 방 또는 이력 방에서만 동작합니다."
@@ -504,7 +545,7 @@ async def show_delete_list(msg, chat_id: int) -> None:
         return
     buttons = []
     for item in records[:50]:
-        expiry = date.fromisoformat(item.expiry_date) if item.expiry_date else expiry_from_text(item.description)
+        expiry = gifticon_expiry(item)
         label = gifticon_summary(item.description, expiry, item.title)
         buttons.append([InlineKeyboardButton(label[:55], callback_data=f"delete_pick:{item.source_message_id}")])
     await msg.reply_text("삭제할 사용 완료 기프티콘을 선택하세요.", reply_markup=InlineKeyboardMarkup(buttons))
@@ -754,6 +795,7 @@ async def mark_as_used(msg, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await STORE.mark_used(gifticon.source_message_id, used_by):
         await msg.reply_text("이미 처리되었거나 찾을 수 없는 기프티콘입니다.")
         return
+    label = gifticon_label(gifticon)
     try:
         await context.bot.delete_message(ACTIVE_CHAT_ID, gifticon.source_message_id)
         deletion = "원본 메시지도 삭제했습니다."
@@ -761,9 +803,9 @@ async def mark_as_used(msg, context: ContextTypes.DEFAULT_TYPE) -> None:
         deletion = "사용 처리는 했지만 원본 삭제에 실패했습니다. 봇의 관리자 권한을 확인하세요."
     await context.bot.send_message(
         ARCHIVE_CHAT_ID,
-        f"사용 완료: {used_by} (원본 메시지 #{gifticon.source_message_id})",
+        f"사용 완료: {label}\n처리자: {used_by} (원본 메시지 #{gifticon.source_message_id})",
     )
-    await msg.reply_text(f"사용 처리했습니다. {deletion}")
+    await msg.reply_text(f"사용 처리했습니다: {label}\n{deletion}")
 
 
 async def confirm_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -799,11 +841,16 @@ async def confirm_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not query.data or not query.data.startswith("use:"):
         return
     source_id = int(query.data.split(":", 1)[1])
+    gifticon = await STORE.get_by_source(source_id)
+    if gifticon is None:
+        await query.edit_message_text("이미 삭제되었거나 찾을 수 없는 기프티콘입니다.")
+        return
     user = query.from_user
     used_by = user.full_name or user.username or str(user.id)
     if not await STORE.mark_used(source_id, used_by):
         await query.edit_message_text("이미 처리되었거나 찾을 수 없는 기프티콘입니다.")
         return
+    label = gifticon_label(gifticon)
     try:
         await context.bot.delete_message(ACTIVE_CHAT_ID, source_id)
         deletion = "사용 방의 원본을 삭제했습니다."
@@ -811,9 +858,9 @@ async def confirm_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         deletion = "사용 처리는 기록했지만 원본 삭제에 실패했습니다. 봇에 삭제 관리자 권한이 있는지 확인하세요."
     await context.bot.send_message(
         ARCHIVE_CHAT_ID,
-        f"사용 완료: {used_by} (원본 메시지 #{source_id})",
+        f"사용 완료: {label}\n처리자: {used_by} (원본 메시지 #{source_id})",
     )
-    await query.edit_message_text(f"사용 완료로 기록했습니다. {deletion}")
+    await query.edit_message_text(f"사용 완료로 기록했습니다: {label}\n{deletion}")
 
 
 async def restore_gifticon(msg, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -844,26 +891,40 @@ async def restore_gifticon(msg, chat_id: int, context: ContextTypes.DEFAULT_TYPE
 async def show_list(msg, status: str | None, query: str = "") -> None:
     status = status or "available"
     records = await STORE.list(status=status, query=query)
+    # The normal unused list and search should only contain usable gifticons.
+    # Expired entries remain accessible through !만료 (/expired).
+    if status == "available":
+        today = kst_today()
+        records = [
+            item
+            for item in records
+            if (expiry := gifticon_expiry(item)) is None or expiry >= today
+        ]
     if not records:
         await msg.reply_text("조건에 맞는 기프티콘이 없습니다.")
         return
     lines = [f"{len(records)}개 기프티콘"]
-    for item in records[:50]:
+    buttons = []
+    for index, item in enumerate(records[:50], start=1):
         state = "미사용" if item.status == "available" else f"사용 ({item.used_by or '알 수 없음'})"
-        expiry = date.fromisoformat(item.expiry_date) if item.expiry_date else expiry_from_text(item.description)
-        lines.append(f"- [{state}] {gifticon_summary(item.description, expiry, item.title)}")
+        expiry = gifticon_expiry(item)
+        lines.append(f"{index}. [{state}] {gifticon_summary(item.description, expiry, item.title)}")
+        if button := gifticon_open_button(item, index):
+            buttons.append([button])
     if len(records) > 50:
         lines.append(f"… 나머지 {len(records) - 50}개는 검색으로 좁혀 보세요.")
-    await msg.reply_text("\n".join(lines))
+    await msg.reply_text(
+        "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
+    )
 
 
 async def show_expiring(msg, days: int, include_expired: bool) -> None:
     records = await STORE.list(status="available")
-    today = date.today()
+    today = kst_today()
     cutoff = today + timedelta(days=days)
     matches = []
     for item in records:
-        expiry = date.fromisoformat(item.expiry_date) if item.expiry_date else expiry_from_text(item.description)
+        expiry = gifticon_expiry(item)
         if expiry is None:
             continue
         if include_expired and expiry < today:
@@ -876,10 +937,15 @@ async def show_expiring(msg, days: int, include_expired: bool) -> None:
         await msg.reply_text(f"{label} 미사용 기프티콘이 없습니다.")
         return
     lines = [f"{len(matches)}개 기프티콘"]
-    for item, expiry in matches[:50]:
+    buttons = []
+    for index, (item, expiry) in enumerate(matches[:50], start=1):
         remaining = (expiry - today).days
-        lines.append(f"- {gifticon_summary(item.description, expiry, item.title)} ({remaining}일 남음)")
-    await msg.reply_text("\n".join(lines))
+        lines.append(f"{index}. {gifticon_summary(item.description, expiry, item.title)} ({remaining}일 남음)")
+        if button := gifticon_open_button(item, index):
+            buttons.append([button])
+    await msg.reply_text(
+        "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
+    )
 
 
 async def notify_expiring(context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -894,12 +960,12 @@ async def _send_expiry_notification(
     context: ContextTypes.DEFAULT_TYPE, days: int, claim: bool
 ) -> int:
     """Send an expiry notice and return the number of included gifticons."""
-    today = datetime.now(ZoneInfo("Asia/Seoul")).date()
+    today = kst_today()
     cutoff = today + timedelta(days=days)
     records = await STORE.list(status="available")
     matches = []
     for item in records:
-        expiry = date.fromisoformat(item.expiry_date) if item.expiry_date else expiry_from_text(item.description)
+        expiry = gifticon_expiry(item)
         if expiry and today <= expiry <= cutoff:
             if not claim or await STORE.claim_expiry_notification(item.source_message_id, today.isoformat()):
                 matches.append((item, expiry))
@@ -910,10 +976,17 @@ async def _send_expiry_notification(
         "⚠️ 유효기간 임박 기프티콘 알림",
         f"{days}일 이내 만료 예정인 미사용 기프티콘입니다.",
     ]
-    for item, expiry in matches[:50]:
+    buttons = []
+    for index, (item, expiry) in enumerate(matches[:50], start=1):
         remaining = (expiry - today).days
-        lines.append(f"- {gifticon_summary(item.description, expiry, item.title)} ({remaining}일 남음)")
-    await context.bot.send_message(ACTIVE_CHAT_ID, "\n".join(lines))
+        lines.append(f"{index}. {gifticon_summary(item.description, expiry, item.title)} ({remaining}일 남음)")
+        if button := gifticon_open_button(item, index):
+            buttons.append([button])
+    await context.bot.send_message(
+        ACTIVE_CHAT_ID,
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+    )
     return len(matches)
 
 
