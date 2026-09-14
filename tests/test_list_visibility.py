@@ -45,12 +45,11 @@ class ListVisibilityTests(unittest.TestCase):
 
         message = asyncio.run(scenario())
         self.assertNotIn("expired", message.text)
-        self.assertIn("current", message.text)
-        self.assertIn("unknown", message.text)
         keyboard = message.kwargs["reply_markup"].inline_keyboard
         self.assertEqual(len(keyboard), 2)
-        self.assertIn("2.", keyboard[1][0].text)
-        self.assertIn("current", keyboard[1][0].text)
+        self.assertIn("current", keyboard[0][0].text)
+        self.assertTrue(keyboard[0][0].url)
+        self.assertIn("unknown", keyboard[1][0].text)
 
 
 if __name__ == "__main__":
