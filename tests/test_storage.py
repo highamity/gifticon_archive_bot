@@ -36,6 +36,13 @@ class GifticonStoreTests(unittest.TestCase):
                 self.assertEqual((await store.get_by_source(11)).status, "available")
                 self.assertEqual(len(await store.list(query="스타")), 1)
 
+                await store.set_title(11, "Coffee Latte")
+                self.assertEqual(len(await store.list(query="Coffee")), 1)
+                self.assertTrue(await store.add_brand("Test Brand"))
+                self.assertFalse(await store.add_brand("Test Brand"))
+                self.assertEqual(await store.list_brands(), ["Test Brand"])
+                self.assertTrue(await store.remove_brand("Test Brand"))
+
                 settings = await store.get_notification_settings()
                 self.assertTrue(settings.enabled)
                 self.assertEqual(settings.days, 7)

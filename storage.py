@@ -85,6 +85,14 @@ class GifticonStore:
                 )
                 conn.execute(
                     """
+                    CREATE TABLE IF NOT EXISTS custom_brands (
+                        name TEXT PRIMARY KEY,
+                        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    )
+                    """
+                )
+                conn.execute(
+                    """
                     INSERT OR IGNORE INTO notification_settings (id, enabled, days, send_time)
                     VALUES (1, 1, 7, '09:00')
                     """
@@ -288,8 +296,8 @@ class GifticonStore:
             clauses.append("status = ?")
             params.append(status)
         if query:
-            clauses.append("description LIKE ?")
-            params.append(f"%{query}%")
+            clauses.append("(description LIKE ? OR title LIKE ?)")
+            params.extend((f"%{query}%", f"%{query}%"))
         where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self._lock:
             conn = self._connect()
@@ -300,6 +308,46 @@ class GifticonStore:
             finally:
                 conn.close()
         return [self._row_to_gifticon(row) for row in rows if row]
+
+    async def list_brands(self) -> list[str]:
+        return await asyncio.to_thread(self.list_brands_sync)
+
+    def list_brands_sync(self) -> list[str]:
+        with self._lock:
+            conn = self._connect()
+            try:
+                rows = conn.execute(
+                    "SELECT name FROM custom_brands ORDER BY name COLLATE NOCASE"
+                ).fetchall()
+            finally:
+                conn.close()
+        return [str(row["name"]) for row in rows]
+
+    async def add_brand(self, name: str) -> bool:
+        return await asyncio.to_thread(self._add_brand_sync, name)
+
+    def _add_brand_sync(self, name: str) -> bool:
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute("INSERT OR IGNORE INTO custom_brands (name) VALUES (?)", (name,))
+                conn.commit()
+                return cur.rowcount == 1
+            finally:
+                conn.close()
+
+    async def remove_brand(self, name: str) -> bool:
+        return await asyncio.to_thread(self._remove_brand_sync, name)
+
+    def _remove_brand_sync(self, name: str) -> bool:
+        with self._lock:
+            conn = self._connect()
+            try:
+                cur = conn.execute("DELETE FROM custom_brands WHERE name = ?", (name,))
+                conn.commit()
+                return cur.rowcount == 1
+            finally:
+                conn.close()
 
     async def claim_expiry_notification(self, source_id: int, notice_date: str) -> bool:
         return await asyncio.to_thread(self._claim_expiry_notification_sync, source_id, notice_date)

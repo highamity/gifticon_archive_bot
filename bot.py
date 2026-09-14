@@ -38,6 +38,7 @@ ARCHIVE_SEMAPHORE = asyncio.Semaphore(1)
 
 DEFAULT_DB = Path(__file__).resolve().parent / "gifticons.db"
 STORE = GifticonStore(Path(os.environ.get("GIFTICON_DB_PATH", str(DEFAULT_DB))))
+CUSTOM_BRANDS = set(STORE.list_brands_sync())
 
 
 def configured_chat_id(name: str) -> int:
@@ -199,6 +200,7 @@ def gifticon_summary(text: str, expiry: date | None = None, title: str | None = 
         "메가MGC커피", "메가커피", "투썸플레이스", "스타벅스", "이마트24",
         "파리바게뜨", "배스킨라빈스", "버거킹", "맥도날드",
     )
+    known_brands = tuple(sorted((*CUSTOM_BRANDS, *known_brands), key=len, reverse=True))
     for candidate in candidates:
         for brand in known_brands:
             if brand in candidate:
@@ -282,6 +284,35 @@ def is_compact_metadata_update_request(message) -> bool:
     return True
 
 
+async def manage_brand(msg, chat_id: int, command: str, argument: str) -> None:
+    if chat_id != ARCHIVE_CHAT_ID:
+        await msg.reply_text("브랜드 관리는 이력 방에서만 실행할 수 있습니다.")
+        return
+    name = argument.strip()
+    if command == "!브랜드목록":
+        brands = await STORE.list_brands()
+        if not brands:
+            await msg.reply_text("추가한 브랜드가 없습니다.")
+            return
+        await msg.reply_text("추가한 브랜드:\n" + "\n".join(f"- {brand}" for brand in brands))
+        return
+    if not name or len(name) > 80 or "\n" in name or "\r" in name:
+        await msg.reply_text("사용법: !브랜드추가 <브랜드명> 또는 !브랜드삭제 <브랜드명>")
+        return
+    if command == "!브랜드추가":
+        if not await STORE.add_brand(name):
+            await msg.reply_text(f"이미 등록된 브랜드입니다: {name}")
+            return
+        CUSTOM_BRANDS.add(name)
+        await msg.reply_text(f"브랜드를 추가했습니다: {name}")
+    elif command == "!브랜드삭제":
+        if not await STORE.remove_brand(name):
+            await msg.reply_text(f"등록된 브랜드가 아닙니다: {name}")
+            return
+        CUSTOM_BRANDS.discard(name)
+        await msg.reply_text(f"브랜드를 삭제했습니다: {name}")
+
+
 def is_use_request(message) -> bool:
     return "사용" in (message.text or "") and message.reply_to_message is not None
 
@@ -295,6 +326,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "이력 방의 보관본에 답장: !복구\n"
             "!목록 / !검색 <단어> / !사용완료\n"
             "!임박 [일수] / !만료 / !강제삭제 / !사용완료삭제 확인 / !초기화 확인\n\n"
+            "이력 방에서 !브랜드추가 <이름> / !브랜드목록 / !브랜드삭제 <이름>으로 자동 요약 브랜드를 관리합니다.\n\n"
             "목록·검색·임박 알림의 '기프티콘 열기' 버튼을 누르면 원본 메시지로 이동합니다.\n"
             "기본 목록과 검색에는 만료된 기프티콘이 표시되지 않으며, !만료에서 확인할 수 있습니다.\n\n"
             "기프티콘에 답장해 유효기간 YYYY-MM-DD 또는 M/D 입력: 유효기간 수정\n\n"
@@ -377,7 +409,9 @@ async def on_management_message(update: Update, context: ContextTypes.DEFAULT_TY
     if not command.startswith("!"):
         command = f"!{command}"
     argument = argument.strip()
-    if command == "!사용":
+    if command in {"!브랜드추가", "!브랜드삭제", "!브랜드목록"}:
+        await manage_brand(msg, chat.id, command, argument)
+    elif command == "!사용":
         if chat.id == ACTIVE_CHAT_ID:
             await mark_as_used(msg, context)
         else:
@@ -1118,6 +1152,11 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("chatid", cmd_chat_id))
+    app.add_handler(CommandHandler("list", cmd_list))
+    app.add_handler(CommandHandler("unused", cmd_unused))
+    app.add_handler(CommandHandler("search", cmd_search))
+    app.add_handler(CommandHandler("expiring", cmd_expiring))
+    app.add_handler(CommandHandler("expired", cmd_expired))
     app.add_handler(CallbackQueryHandler(confirm_use))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_management_message), group=0)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, archive_message), group=1)
