@@ -153,7 +153,13 @@ def gifticon_open_button(gifticon: Gifticon, index: int) -> InlineKeyboardButton
         else gifticon.archive_message_id
     )
     url = telegram_message_link(target_chat_id, target_message_id)
-    return InlineKeyboardButton(f"{index}번 기프티콘 열기", url=url) if url else None
+    if not url:
+        return None
+    summary = gifticon_label(gifticon)
+    name = summary.split(" / ", 1)[0].strip() or "기프티콘"
+    if len(name) > 22:
+        name = f"{name[:21]}…"
+    return InlineKeyboardButton(f"열기 · {index}. {name}", url=url)
 
 
 def gifticon_summary(text: str, expiry: date | None = None, title: str | None = None) -> str:

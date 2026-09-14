@@ -49,7 +49,8 @@ class ListVisibilityTests(unittest.TestCase):
         self.assertIn("unknown", message.text)
         keyboard = message.kwargs["reply_markup"].inline_keyboard
         self.assertEqual(len(keyboard), 2)
-        self.assertIn("2번", keyboard[1][0].text)
+        self.assertIn("2.", keyboard[1][0].text)
+        self.assertIn("current", keyboard[1][0].text)
 
 
 if __name__ == "__main__":
