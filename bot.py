@@ -23,6 +23,7 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
+from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -595,16 +596,25 @@ async def show_delete_list(msg, chat_id: int) -> None:
     if chat_id != ACTIVE_CHAT_ID:
         await msg.reply_text("!삭제는 사용방에서 실행하세요.")
         return
-    records = await STORE.list(status="used")
+    records = await STORE.list()
     if not records:
-        await msg.reply_text("삭제할 사용 완료 기프티콘이 없습니다.")
+        await msg.reply_text("🗑 삭제할 기프티콘이 없습니다.", reply_markup=MAIN_KEYBOARD)
         return
+
+    # Sort available first, then used; newest first
+    records.sort(key=lambda r: (0 if r.status == "available" else 1))
+
     buttons = []
-    for item in records[:50]:
-        expiry = gifticon_expiry(item)
-        label = gifticon_summary(item.description, expiry, item.title)
-        buttons.append([InlineKeyboardButton(label[:55], callback_data=f"delete_pick:{item.source_message_id}")])
-    await msg.reply_text("삭제할 사용 완료 기프티콘을 선택하세요.", reply_markup=InlineKeyboardMarkup(buttons))
+    for item in records[:30]:
+        state = "미사용" if item.status == "available" else "사용완료"
+        label = gifticon_label(item)
+        buttons.append([InlineKeyboardButton(f"🗑 [{state}] {label[:40]}", callback_data=f"delete_pick:{item.source_message_id}")])
+    buttons.append([InlineKeyboardButton("❌ 취소", callback_data="delete_cancel")])
+    await msg.reply_text(
+        "🗑 <b>삭제할 기프티콘을 선택하세요:</b>",
+        reply_markup=InlineKeyboardMarkup(buttons),
+        parse_mode=ParseMode.HTML,
+    )
 
 
 async def delete_selected(update: Update, context: ContextTypes.DEFAULT_TYPE, source_id: int) -> None:
@@ -616,11 +626,13 @@ async def delete_selected(update: Update, context: ContextTypes.DEFAULT_TYPE, so
         return
     gifticon = await STORE.get_by_source(source_id)
     if gifticon is None:
-        await query.edit_message_text("이미 삭제되었거나 찾을 수 없는 기프티콘입니다.")
+        await query.answer("이미 삭제되었거나 찾을 수 없는 기프티콘입니다.", show_alert=True)
+        await query.edit_message_text("⚠️ 이미 삭제되었거나 찾을 수 없는 기프티콘입니다.")
         return
-    await query.answer()
+    label = gifticon_label(gifticon)
     if not await STORE.delete(source_id):
-        await query.edit_message_text("DB 항목을 삭제하지 못했습니다.")
+        await query.answer("DB 항목을 삭제하지 못했습니다.", show_alert=True)
+        await query.edit_message_text("❌ DB 항목을 삭제하지 못했습니다.")
         return
     deleted_messages = []
     for target_chat, message_id in (
@@ -632,9 +644,11 @@ async def delete_selected(update: Update, context: ContextTypes.DEFAULT_TYPE, so
             deleted_messages.append(message_id)
         except TelegramError:
             pass
+    await query.answer(f"삭제 완료")
     await query.edit_message_text(
-        "선택한 기프티콘을 삭제했습니다. "
-        + ("관련 Telegram 메시지도 삭제했습니다." if deleted_messages else "DB 항목만 삭제했습니다.")
+        f"🗑 <b>{label}</b> 기프티콘을 삭제했습니다."
+        + ("\n(관련 메시지도 삭제되었습니다.)" if deleted_messages else ""),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -870,23 +884,11 @@ async def confirm_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if query.data and query.data.startswith("delete_pick:"):
         source_id = int(query.data.split(":", 1)[1])
-        gifticon = await STORE.get_by_source(source_id)
-        if gifticon is None:
-            await query.edit_message_text("이미 삭제되었거나 찾을 수 없는 기프티콘입니다.")
-            return
-        keyboard = InlineKeyboardMarkup(
-            [[
-                InlineKeyboardButton("삭제 확인", callback_data=f"delete_confirm:{source_id}"),
-                InlineKeyboardButton("취소", callback_data="delete_cancel"),
-            ]]
-        )
-        await query.edit_message_text(
-            f"다음 기프티콘을 삭제할까요?\n{gifticon_summary(gifticon.description, expiry_from_text(gifticon.description), gifticon.title)}",
-            reply_markup=keyboard,
-        )
+        await delete_selected(update, context, source_id)
         return
     if query.data == "delete_cancel":
-        await query.edit_message_text("삭제를 취소했습니다.")
+        await query.answer("삭제를 취소했습니다.")
+        await query.edit_message_text("❌ 삭제가 취소되었습니다.")
         return
     if query.data and query.data.startswith("delete_confirm:"):
         await delete_selected(update, context, int(query.data.split(":", 1)[1]))
