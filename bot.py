@@ -8,7 +8,7 @@ import sys
 import asyncio
 import io
 import re
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -65,7 +65,10 @@ def configured_chat_id(name: str) -> int:
 
 ACTIVE_CHAT_ID = configured_chat_id("GIFTICON_ACTIVE_CHAT_ID")
 ARCHIVE_CHAT_ID = configured_chat_id("GIFTICON_ARCHIVE_CHAT_ID")
-KST = ZoneInfo("Asia/Seoul")
+try:
+    KST = ZoneInfo("Asia/Seoul")
+except Exception:
+    KST = timezone(timedelta(hours=9), name="Asia/Seoul")
 
 
 def description_for(message) -> str:
@@ -159,7 +162,7 @@ def telegram_message_link(chat_id: int, message_id: int) -> str | None:
     return f"https://t.me/c/{chat_id_text[4:]}/{message_id}"
 
 
-def gifticon_open_button(gifticon: Gifticon) -> InlineKeyboardButton | None:
+def gifticon_open_button(gifticon: Gifticon, index: int) -> InlineKeyboardButton | None:
     target_chat_id = ACTIVE_CHAT_ID if gifticon.status == "available" else ARCHIVE_CHAT_ID
     target_message_id = (
         gifticon.source_message_id
@@ -169,10 +172,11 @@ def gifticon_open_button(gifticon: Gifticon) -> InlineKeyboardButton | None:
     url = telegram_message_link(target_chat_id, target_message_id)
     if not url:
         return None
-    label = gifticon_label(gifticon) or "기프티콘"
-    if len(label) > 55:
-        label = f"{label[:54]}…"
-    return InlineKeyboardButton(label, url=url)
+    summary = gifticon_label(gifticon)
+    name = summary.split(" / ", 1)[0].strip() or "기프티콘"
+    if len(name) > 22:
+        name = f"{name[:21]}…"
+    return InlineKeyboardButton(f"열기 · {index}. {name}", url=url)
 
 
 def gifticon_summary(text: str, expiry: date | None = None, title: str | None = None) -> str:
@@ -291,7 +295,9 @@ def is_compact_metadata_update_request(message) -> bool:
     raw = (message.text or "").strip()
     if message.reply_to_message is None or not raw:
         return False
-    if raw.startswith("!") or raw.split(maxsplit=1)[0] in {"제목", "유효기간"}:
+    if raw.startswith("!") or raw.startswith("/") or raw.split(maxsplit=1)[0] in {"제목", "유효기간"}:
+        return False
+    if is_use_request(message):
         return False
     return True
 
@@ -326,7 +332,14 @@ async def manage_brand(msg, chat_id: int, command: str, argument: str) -> None:
 
 
 def is_use_request(message) -> bool:
-    return "사용" in (message.text or "") and message.reply_to_message is not None
+    raw = (message.text or "").strip()
+    if message.reply_to_message is None or not raw:
+        return False
+    if raw.startswith("!"):
+        return raw == "!사용"
+    if "미사용" in raw:
+        return False
+    return raw in {"사용", "사용완료"} or raw.startswith("사용 ") or raw.startswith("사용\n")
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -339,7 +352,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "!미사용 / !목록 / !검색 <단어> / !사용완료\n"
             "!임박 [일수] / !만료 / !삭제 / !사용완료삭제 확인 / !초기화 확인\n\n"
             "이력 방에서 !브랜드추가 <이름> / !브랜드목록 / !브랜드삭제 <이름>으로 자동 요약 브랜드를 관리합니다.\n\n"
-            "목록·검색·임박 알림은 기프티콘 이름과 유효기간이 표시된 버튼을 누르면 원본 메시지로 이동합니다.\n"
+            "목록·검색·임박 알림의 '열기' 버튼을 누르면 원본 메시지로 이동합니다.\n"
             "기본 목록과 검색에는 만료된 기프티콘이 표시되지 않으며, !만료에서 확인할 수 있습니다.\n\n"
             "기프티콘에 답장해 유효기간 YYYY-MM-DD 또는 M/D 입력: 유효기간 수정\n\n"
             "기프티콘에 답장해 제목 새 제목 입력: 목록 제목 수정\n\n"
@@ -463,7 +476,7 @@ async def on_management_message(update: Update, context: ContextTypes.DEFAULT_TY
     elif command == "!만료":
         await show_expiring(msg, 0, include_expired=True)
     elif command in {"!삭제", "!삭제목록"}:
-        if command == "!삭제" and chat.id == ACTIVE_CHAT_ID and not msg.reply_to_message:
+        if chat.id == ACTIVE_CHAT_ID:
             await show_delete_list(msg, chat.id)
         else:
             await force_delete(msg, chat.id, context)
@@ -963,17 +976,14 @@ async def show_list(msg, status: str | None, query: str = "") -> None:
         return
     lines = [f"{len(records)}개 기프티콘"]
     buttons = []
-    item_lines = []
     for index, item in enumerate(records[:50], start=1):
         state = "미사용" if item.status == "available" else f"사용 ({item.used_by or '알 수 없음'})"
         expiry = gifticon_expiry(item)
-        item_lines.append(f"{index}. [{state}] {gifticon_summary(item.description, expiry, item.title)}")
-        if button := gifticon_open_button(item):
+        lines.append(f"{index}. [{state}] {gifticon_summary(item.description, expiry, item.title)}")
+        if button := gifticon_open_button(item, index):
             buttons.append([button])
     if len(records) > 50:
         lines.append(f"… 나머지 {len(records) - 50}개는 검색으로 좁혀 보세요.")
-    if not buttons:
-        lines.extend(item_lines)
     await msg.reply_text(
         "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
     )
@@ -999,14 +1009,11 @@ async def show_expiring(msg, days: int, include_expired: bool) -> None:
         return
     lines = [f"{len(matches)}개 기프티콘"]
     buttons = []
-    item_lines = []
     for index, (item, expiry) in enumerate(matches[:50], start=1):
         remaining = (expiry - today).days
-        item_lines.append(f"{index}. {gifticon_summary(item.description, expiry, item.title)} ({remaining}일 남음)")
-        if button := gifticon_open_button(item):
+        lines.append(f"{index}. {gifticon_summary(item.description, expiry, item.title)} ({remaining}일 남음)")
+        if button := gifticon_open_button(item, index):
             buttons.append([button])
-    if not buttons:
-        lines.extend(item_lines)
     await msg.reply_text(
         "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
     )
@@ -1041,14 +1048,11 @@ async def _send_expiry_notification(
         f"{days}일 이내 만료 예정인 미사용 기프티콘입니다.",
     ]
     buttons = []
-    item_lines = []
     for index, (item, expiry) in enumerate(matches[:50], start=1):
         remaining = (expiry - today).days
-        item_lines.append(f"{index}. {gifticon_summary(item.description, expiry, item.title)} ({remaining}일 남음)")
-        if button := gifticon_open_button(item):
+        lines.append(f"{index}. {gifticon_summary(item.description, expiry, item.title)} ({remaining}일 남음)")
+        if button := gifticon_open_button(item, index):
             buttons.append([button])
-    if not buttons:
-        lines.extend(item_lines)
     await context.bot.send_message(
         ACTIVE_CHAT_ID,
         "\n".join(lines),
@@ -1062,7 +1066,7 @@ def parse_notification_time(value: str) -> time | None:
         parsed = datetime.strptime(value.strip(), "%H:%M").time()
     except ValueError:
         return None
-    return parsed.replace(tzinfo=ZoneInfo("Asia/Seoul"))
+    return parsed.replace(tzinfo=KST)
 
 
 async def schedule_expiry_job(job_queue) -> None:

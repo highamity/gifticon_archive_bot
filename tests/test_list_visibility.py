@@ -8,7 +8,13 @@ os.environ.setdefault("GIFTICON_ACTIVE_CHAT_ID", "-1001234567890")
 os.environ.setdefault("GIFTICON_ARCHIVE_CHAT_ID", "-1009876543210")
 
 try:
-    from bot import Gifticon, show_list
+    from bot import (
+        Gifticon,
+        gifticon_open_button,
+        is_compact_metadata_update_request,
+        is_use_request,
+        show_list,
+    )
 except ModuleNotFoundError as error:
     BOT_IMPORT_ERROR = str(error)
 else:
@@ -45,11 +51,52 @@ class ListVisibilityTests(unittest.TestCase):
 
         message = asyncio.run(scenario())
         self.assertNotIn("expired", message.text)
+        self.assertIn("current", message.text)
+        self.assertIn("unknown", message.text)
         keyboard = message.kwargs["reply_markup"].inline_keyboard
         self.assertEqual(len(keyboard), 2)
         self.assertIn("current", keyboard[0][0].text)
         self.assertTrue(keyboard[0][0].url)
         self.assertIn("unknown", keyboard[1][0].text)
+
+    def test_reply_button_command_routing(self) -> None:
+        class MockMsg:
+            def __init__(self, text, reply_to_message=None):
+                self.text = text
+                self.reply_to_message = reply_to_message
+
+        dummy_reply = object()
+
+        # Keyboard commands starting with ! should NOT be treated as use requests
+        self.assertFalse(is_use_request(MockMsg("!미사용", dummy_reply)))
+        self.assertFalse(is_use_request(MockMsg("!임박", dummy_reply)))
+        self.assertFalse(is_use_request(MockMsg("!삭제", dummy_reply)))
+        self.assertFalse(is_use_request(MockMsg("!목록", dummy_reply)))
+        self.assertFalse(is_use_request(MockMsg("미사용", dummy_reply)))
+
+        # Explicit use commands
+        self.assertTrue(is_use_request(MockMsg("!사용", dummy_reply)))
+        self.assertTrue(is_use_request(MockMsg("사용", dummy_reply)))
+        self.assertTrue(is_use_request(MockMsg("사용완료", dummy_reply)))
+        self.assertTrue(is_use_request(MockMsg("사용 완료", dummy_reply)))
+
+        # Without reply_to_message, is_use_request is always False
+        self.assertFalse(is_use_request(MockMsg("!사용", None)))
+        self.assertFalse(is_use_request(MockMsg("사용", None)))
+
+        # Metadata update should not match ! commands or use requests
+        self.assertFalse(is_compact_metadata_update_request(MockMsg("!미사용", dummy_reply)))
+        self.assertFalse(is_compact_metadata_update_request(MockMsg("!삭제", dummy_reply)))
+        self.assertFalse(is_compact_metadata_update_request(MockMsg("사용", dummy_reply)))
+        self.assertFalse(is_compact_metadata_update_request(MockMsg("!사용", dummy_reply)))
+        self.assertTrue(is_compact_metadata_update_request(MockMsg("스타벅스 10/10", dummy_reply)))
+
+    def test_gifticon_open_button_format(self) -> None:
+        item = Gifticon(1, 101, "스타벅스 카페아메리카노", "스타벅스 카페아메리카노", "available", None, None, "2026-09-14")
+        button = gifticon_open_button(item, 1)
+        self.assertIsNotNone(button)
+        self.assertEqual(button.text, "열기 · 1. 스타벅스 카페아메리카노")
+        self.assertEqual(button.url, "https://t.me/c/1234567890/101")
 
 
 if __name__ == "__main__":
