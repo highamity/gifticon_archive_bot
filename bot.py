@@ -15,7 +15,14 @@ from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 from PIL import Image, ImageFilter, ImageOps
 import pytesseract
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import (
+    BotCommand,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    Update,
+)
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
@@ -39,6 +46,11 @@ ARCHIVE_SEMAPHORE = asyncio.Semaphore(1)
 DEFAULT_DB = Path(__file__).resolve().parent / "gifticons.db"
 STORE = GifticonStore(Path(os.environ.get("GIFTICON_DB_PATH", str(DEFAULT_DB))))
 CUSTOM_BRANDS = set(STORE.list_brands_sync())
+MAIN_KEYBOARD = ReplyKeyboardMarkup(
+    [[KeyboardButton("!미사용"), KeyboardButton("!임박"), KeyboardButton("!삭제")]],
+    resize_keyboard=True,
+    is_persistent=True,
+)
 
 
 def configured_chat_id(name: str) -> int:
@@ -323,14 +335,15 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "기프티콘 보관 봇입니다. 사용 방에 올린 사진·파일·텍스트를 이력 방에 자동 보관합니다.\n\n"
             "사용할 기프티콘에 답장: !사용 또는 '사용'이 포함된 답장\n"
             "이력 방의 보관본에 답장: !복구\n"
-            "!목록 / !검색 <단어> / !사용완료\n"
-            "!임박 [일수] / !만료 / !강제삭제 / !사용완료삭제 확인 / !초기화 확인\n\n"
+            "!미사용 / !목록 / !검색 <단어> / !사용완료\n"
+            "!임박 [일수] / !만료 / !삭제 / !사용완료삭제 확인 / !초기화 확인\n\n"
             "이력 방에서 !브랜드추가 <이름> / !브랜드목록 / !브랜드삭제 <이름>으로 자동 요약 브랜드를 관리합니다.\n\n"
             "목록·검색·임박 알림은 기프티콘 이름과 유효기간이 표시된 버튼을 누르면 원본 메시지로 이동합니다.\n"
             "기본 목록과 검색에는 만료된 기프티콘이 표시되지 않으며, !만료에서 확인할 수 있습니다.\n\n"
             "기프티콘에 답장해 유효기간 YYYY-MM-DD 또는 M/D 입력: 유효기간 수정\n\n"
             "기프티콘에 답장해 제목 새 제목 입력: 목록 제목 수정\n\n"
-            "관리용 명령은 사용 방 또는 이력 방에서만 동작합니다."
+            "관리용 명령은 사용 방 또는 이력 방에서만 동작합니다.",
+            reply_markup=MAIN_KEYBOARD,
         )
 
 
@@ -380,7 +393,8 @@ async def archive_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try:
             await msg.reply_text(
                 "이력 방에 보관했습니다.\n\n"
-                f"인식 내용: {recognized_preview}"
+                f"인식 내용: {recognized_preview}",
+                reply_markup=MAIN_KEYBOARD,
             )
         except TelegramError:
             logger.exception("Could not acknowledge archived message %s", msg.message_id)
@@ -447,10 +461,13 @@ async def on_management_message(update: Update, context: ContextTypes.DEFAULT_TY
             await show_expiring(msg, days, include_expired=False)
     elif command == "!만료":
         await show_expiring(msg, 0, include_expired=True)
-    elif command in {"!강제삭제", "!삭제"}:
+    elif command in {"!삭제", "!삭제목록"}:
+        if command == "!삭제" and chat.id == ACTIVE_CHAT_ID and not msg.reply_to_message:
+            await show_delete_list(msg, chat.id)
+        else:
+            await force_delete(msg, chat.id, context)
+    elif command == "!강제삭제":
         await force_delete(msg, chat.id, context)
-    elif command == "!삭제목록":
-        await show_delete_list(msg, chat.id)
     elif command == "!초기화":
         await reset_store(msg, chat.id, argument)
 
@@ -576,7 +593,7 @@ async def force_delete(msg, chat_id: int, context: ContextTypes.DEFAULT_TYPE) ->
 
 async def show_delete_list(msg, chat_id: int) -> None:
     if chat_id != ACTIVE_CHAT_ID:
-        await msg.reply_text("!삭제목록은 사용방에서 실행하세요.")
+        await msg.reply_text("!삭제는 사용방에서 실행하세요.")
         return
     records = await STORE.list(status="used")
     if not records:
@@ -1151,12 +1168,26 @@ async def test_expiry_notification(
         await msg.reply_text(f"{days}일 이내 만료 예정인 미사용 쿠폰이 없습니다.")
 
 
+async def post_init(application: Application) -> None:
+    commands = [
+        BotCommand("start", "도움말 및 하단 버튼 활성화"),
+        BotCommand("unused", "미사용 기프티콘 목록"),
+        BotCommand("expiring", "만료 임박 기프티콘"),
+        BotCommand("expired", "만료된 기프티콘"),
+        BotCommand("chatid", "현재 채팅방 ID 확인"),
+    ]
+    try:
+        await application.bot.set_my_commands(commands)
+    except Exception:
+        logger.exception("Could not set bot commands")
+
+
 def main() -> None:
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     if not token:
         logger.error("Set TELEGRAM_BOT_TOKEN in the environment or .env file.")
         sys.exit(1)
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(post_init).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("chatid", cmd_chat_id))
