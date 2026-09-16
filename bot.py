@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
+import html
+import io
 import logging
 import os
-import sys
-import asyncio
-import io
 import re
+import sys
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -23,6 +24,10 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
+try:
+    from telegram import LinkPreviewOptions
+except ImportError:
+    LinkPreviewOptions = None
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
@@ -162,14 +167,30 @@ def telegram_message_link(chat_id: int, message_id: int) -> str | None:
     return f"https://t.me/c/{chat_id_text[4:]}/{message_id}"
 
 
-def gifticon_open_button(gifticon: Gifticon, index: int) -> InlineKeyboardButton | None:
+def no_preview_kwargs() -> dict:
+    """Disable URL link previews in Telegram messages."""
+    if LinkPreviewOptions is not None:
+        return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
+    return {"disable_web_page_preview": True}
+
+
+def gifticon_url(gifticon: Gifticon) -> str | None:
     target_chat_id = ACTIVE_CHAT_ID if gifticon.status == "available" else ARCHIVE_CHAT_ID
     target_message_id = (
         gifticon.source_message_id
         if gifticon.status == "available"
         else gifticon.archive_message_id
     )
-    url = telegram_message_link(target_chat_id, target_message_id)
+    return telegram_message_link(target_chat_id, target_message_id)
+
+
+def gifticon_open_link(gifticon: Gifticon) -> str:
+    url = gifticon_url(gifticon)
+    return f' <a href="{url}">열기</a>' if url else ""
+
+
+def gifticon_open_button(gifticon: Gifticon, index: int = 1) -> InlineKeyboardButton | None:
+    url = gifticon_url(gifticon)
     if not url:
         return None
     summary = gifticon_label(gifticon)
@@ -352,7 +373,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "!미사용 / !목록 / !검색 <단어> / !사용완료\n"
             "!임박 [일수] / !만료 / !삭제 / !사용완료삭제 확인 / !초기화 확인\n\n"
             "이력 방에서 !브랜드추가 <이름> / !브랜드목록 / !브랜드삭제 <이름>으로 자동 요약 브랜드를 관리합니다.\n\n"
-            "목록·검색·임박 알림의 '열기' 버튼을 누르면 원본 메시지로 이동합니다.\n"
+            "목록·검색·임박 알림의 '열기' 링크를 누르면 원본 메시지로 이동합니다.\n"
             "기본 목록과 검색에는 만료된 기프티콘이 표시되지 않으며, !만료에서 확인할 수 있습니다.\n\n"
             "기프티콘에 답장해 유효기간 YYYY-MM-DD 또는 M/D 입력: 유효기간 수정\n\n"
             "기프티콘에 답장해 제목 새 제목 입력: 목록 제목 수정\n\n"
@@ -975,17 +996,18 @@ async def show_list(msg, status: str | None, query: str = "") -> None:
         await msg.reply_text("조건에 맞는 기프티콘이 없습니다.")
         return
     lines = [f"{len(records)}개 기프티콘"]
-    buttons = []
     for index, item in enumerate(records[:50], start=1):
-        state = "미사용" if item.status == "available" else f"사용 ({item.used_by or '알 수 없음'})"
+        state = "미사용" if item.status == "available" else f"사용 ({html.escape(item.used_by or '알 수 없음')})"
         expiry = gifticon_expiry(item)
-        lines.append(f"{index}. [{state}] {gifticon_summary(item.description, expiry, item.title)}")
-        if button := gifticon_open_button(item, index):
-            buttons.append([button])
+        summary = html.escape(gifticon_summary(item.description, expiry, item.title))
+        open_link = gifticon_open_link(item)
+        lines.append(f"{index}. [{state}] {summary}{open_link}")
     if len(records) > 50:
         lines.append(f"… 나머지 {len(records) - 50}개는 검색으로 좁혀 보세요.")
     await msg.reply_text(
-        "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        **no_preview_kwargs(),
     )
 
 
@@ -1008,14 +1030,15 @@ async def show_expiring(msg, days: int, include_expired: bool) -> None:
         await msg.reply_text(f"{label} 미사용 기프티콘이 없습니다.")
         return
     lines = [f"{len(matches)}개 기프티콘"]
-    buttons = []
     for index, (item, expiry) in enumerate(matches[:50], start=1):
         remaining = (expiry - today).days
-        lines.append(f"{index}. {gifticon_summary(item.description, expiry, item.title)} ({remaining}일 남음)")
-        if button := gifticon_open_button(item, index):
-            buttons.append([button])
+        summary = html.escape(gifticon_summary(item.description, expiry, item.title))
+        open_link = gifticon_open_link(item)
+        lines.append(f"{index}. {summary} ({remaining}일 남음){open_link}")
     await msg.reply_text(
-        "\n".join(lines), reply_markup=InlineKeyboardMarkup(buttons) if buttons else None
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        **no_preview_kwargs(),
     )
 
 
@@ -1047,16 +1070,16 @@ async def _send_expiry_notification(
         "⚠️ 유효기간 임박 기프티콘 알림",
         f"{days}일 이내 만료 예정인 미사용 기프티콘입니다.",
     ]
-    buttons = []
     for index, (item, expiry) in enumerate(matches[:50], start=1):
         remaining = (expiry - today).days
-        lines.append(f"{index}. {gifticon_summary(item.description, expiry, item.title)} ({remaining}일 남음)")
-        if button := gifticon_open_button(item, index):
-            buttons.append([button])
+        summary = html.escape(gifticon_summary(item.description, expiry, item.title))
+        open_link = gifticon_open_link(item)
+        lines.append(f"{index}. {summary} ({remaining}일 남음){open_link}")
     await context.bot.send_message(
         ACTIVE_CHAT_ID,
         "\n".join(lines),
-        reply_markup=InlineKeyboardMarkup(buttons) if buttons else None,
+        parse_mode=ParseMode.HTML,
+        **no_preview_kwargs(),
     )
     return len(matches)
 

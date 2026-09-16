@@ -11,6 +11,7 @@ try:
     from bot import (
         Gifticon,
         gifticon_open_button,
+        gifticon_open_link,
         is_compact_metadata_update_request,
         is_use_request,
         show_list,
@@ -53,11 +54,9 @@ class ListVisibilityTests(unittest.TestCase):
         self.assertNotIn("expired", message.text)
         self.assertIn("current", message.text)
         self.assertIn("unknown", message.text)
-        keyboard = message.kwargs["reply_markup"].inline_keyboard
-        self.assertEqual(len(keyboard), 2)
-        self.assertIn("current", keyboard[0][0].text)
-        self.assertTrue(keyboard[0][0].url)
-        self.assertIn("unknown", keyboard[1][0].text)
+        self.assertIn('<a href="https://t.me/c/1234567890/2">열기</a>', message.text)
+        self.assertIn('<a href="https://t.me/c/1234567890/3">열기</a>', message.text)
+        self.assertNotIn("reply_markup", message.kwargs)
 
     def test_reply_button_command_routing(self) -> None:
         class MockMsg:
@@ -90,6 +89,11 @@ class ListVisibilityTests(unittest.TestCase):
         self.assertFalse(is_compact_metadata_update_request(MockMsg("사용", dummy_reply)))
         self.assertFalse(is_compact_metadata_update_request(MockMsg("!사용", dummy_reply)))
         self.assertTrue(is_compact_metadata_update_request(MockMsg("스타벅스 10/10", dummy_reply)))
+
+    def test_gifticon_open_link_format(self) -> None:
+        item = Gifticon(1, 101, "스타벅스 카페아메리카노", "스타벅스 카페아메리카노", "available", None, None, "2026-09-14")
+        link = gifticon_open_link(item)
+        self.assertEqual(link, ' <a href="https://t.me/c/1234567890/101">열기</a>')
 
     def test_gifticon_open_button_format(self) -> None:
         item = Gifticon(1, 101, "스타벅스 카페아메리카노", "스타벅스 카페아메리카노", "available", None, None, "2026-09-14")
