@@ -91,12 +91,12 @@ class ListVisibilityTests(unittest.TestCase):
         self.assertTrue(is_compact_metadata_update_request(MockMsg("스타벅스 10/10", dummy_reply)))
 
     def test_gifticon_open_link_format(self) -> None:
-        item = Gifticon(1, 101, "스타벅스 카페아메리카노", "스타벅스 카페아메리카노", "available", None, None, "2026-09-14")
+        item = Gifticon(101, 1, "스타벅스 카페아메리카노", "스타벅스 카페아메리카노", "available", None, None, "2026-09-14")
         link = gifticon_open_link(item)
         self.assertEqual(link, ' <a href="https://t.me/c/1234567890/101">열기</a>')
 
     def test_gifticon_open_button_format(self) -> None:
-        item = Gifticon(1, 101, "스타벅스 카페아메리카노", "스타벅스 카페아메리카노", "available", None, None, "2026-09-14")
+        item = Gifticon(101, 1, "스타벅스 카페아메리카노", "스타벅스 카페아메리카노", "available", None, None, "2026-09-14")
         button = gifticon_open_button(item, 1)
         self.assertIsNotNone(button)
         self.assertEqual(button.text, "열기 · 1. 스타벅스 카페아메리카노")
