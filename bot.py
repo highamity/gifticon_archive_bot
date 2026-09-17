@@ -1044,10 +1044,14 @@ async def show_expiring(msg, days: int, include_expired: bool) -> None:
 
 async def notify_expiring(context: ContextTypes.DEFAULT_TYPE) -> int:
     """Notify the normal use room once daily about gifts expiring soon."""
+    logger.info("Running daily expiry notification job...")
     settings = await STORE.get_notification_settings()
     if not settings.enabled:
+        logger.info("Daily expiry notification is disabled.")
         return 0
-    return await _send_expiry_notification(context, settings.days, claim=True)
+    count = await _send_expiry_notification(context, settings.days, claim=True)
+    logger.info("Daily expiry notification completed. Sent for %d gifticons.", count)
+    return count
 
 
 async def _send_expiry_notification(
@@ -1075,12 +1079,16 @@ async def _send_expiry_notification(
         summary = html.escape(gifticon_summary(item.description, expiry, item.title))
         open_link = gifticon_open_link(item)
         lines.append(f"{index}. {summary} ({remaining}일 남음){open_link}")
-    await context.bot.send_message(
-        ACTIVE_CHAT_ID,
-        "\n".join(lines),
-        parse_mode=ParseMode.HTML,
-        **no_preview_kwargs(),
-    )
+    try:
+        await context.bot.send_message(
+            ACTIVE_CHAT_ID,
+            "\n".join(lines),
+            parse_mode=ParseMode.HTML,
+            **no_preview_kwargs(),
+        )
+    except TelegramError:
+        logger.exception("Could not send expiry notification to active chat %s", ACTIVE_CHAT_ID)
+        return 0
     return len(matches)
 
 
@@ -1094,6 +1102,9 @@ def parse_notification_time(value: str) -> time | None:
 
 async def schedule_expiry_job(job_queue) -> None:
     """Replace the daily job using the persisted notification settings."""
+    if job_queue is None:
+        logger.warning("Job queue is not available; cannot schedule expiry notification.")
+        return
     for job in job_queue.get_jobs_by_name(NOTIFICATION_JOB_NAME):
         job.schedule_removal()
     settings = await STORE.get_notification_settings()
@@ -1103,6 +1114,13 @@ async def schedule_expiry_job(job_queue) -> None:
             logger.error("Invalid persisted notification time: %s", settings.send_time)
             return
         job_queue.run_daily(notify_expiring, time=send_time, name=NOTIFICATION_JOB_NAME)
+        logger.info(
+            "Scheduled daily expiry notification: %s (KST), criteria <= %d days",
+            settings.send_time,
+            settings.days,
+        )
+    else:
+        logger.info("Daily expiry notification is disabled in settings.")
 
 
 async def load_expiry_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1209,6 +1227,7 @@ async def post_init(application: Application) -> None:
         await application.bot.set_my_commands(commands)
     except Exception:
         logger.exception("Could not set bot commands")
+    await schedule_expiry_job(application.job_queue)
 
 
 def main() -> None:
@@ -1228,7 +1247,6 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(confirm_use))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_management_message), group=0)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, archive_message), group=1)
-    app.job_queue.run_once(load_expiry_job, when=0, name="load-expiry-notice-settings")
     logger.info("Polling started for active=%s archive=%s", ACTIVE_CHAT_ID, ARCHIVE_CHAT_ID)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
