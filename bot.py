@@ -886,7 +886,7 @@ async def mark_as_used(msg, context: ContextTypes.DEFAULT_TYPE) -> None:
     replied = msg.reply_to_message
     if replied is None:
         return
-    gifticon = await STORE.get_by_source(replied.message_id)
+    gifticon = await gifticon_for_reply(msg, ACTIVE_CHAT_ID)
     if gifticon is None:
         await msg.reply_text("답장한 메시지는 보관된 기프티콘이 아닙니다.")
         return
@@ -903,8 +903,13 @@ async def mark_as_used(msg, context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await context.bot.delete_message(ACTIVE_CHAT_ID, gifticon.source_message_id)
         deletion = "원본 메시지도 삭제했습니다."
-    except BadRequest:
-        deletion = "사용 처리는 했지만 원본 삭제에 실패했습니다. 봇의 관리자 권한을 확인하세요."
+    except BadRequest as error:
+        logger.warning("Failed to delete source message %s: %s", gifticon.source_message_id, error)
+        err_msg = str(error).lower()
+        if "can't be deleted" in err_msg or "message to delete not found" in err_msg:
+            deletion = "사용 처리는 완료되었습니다.\n(텔레그램 정책상 48시간이 지난 원본 메시지는 봇이 삭제할 수 없어 직접 삭제해 주셔야 합니다.)"
+        else:
+            deletion = f"사용 처리는 했지만 원본 삭제에 실패했습니다. ({error.message})"
     await context.bot.send_message(
         ARCHIVE_CHAT_ID,
         f"사용 완료: {label}\n처리자: {used_by} (원본 메시지 #{gifticon.source_message_id})",
@@ -946,8 +951,13 @@ async def confirm_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     try:
         await context.bot.delete_message(ACTIVE_CHAT_ID, source_id)
         deletion = "사용 방의 원본을 삭제했습니다."
-    except BadRequest:
-        deletion = "사용 처리는 기록했지만 원본 삭제에 실패했습니다. 봇에 삭제 관리자 권한이 있는지 확인하세요."
+    except BadRequest as error:
+        logger.warning("Failed to delete source message %s: %s", source_id, error)
+        err_msg = str(error).lower()
+        if "can't be deleted" in err_msg or "message to delete not found" in err_msg:
+            deletion = "사용 처리는 기록되었습니다.\n(텔레그램 정책상 48시간이 지난 원본 메시지는 직접 삭제해 주셔야 합니다.)"
+        else:
+            deletion = f"사용 처리는 기록했지만 원본 삭제에 실패했습니다. ({error.message})"
     await context.bot.send_message(
         ARCHIVE_CHAT_ID,
         f"사용 완료: {label}\n처리자: {used_by} (원본 메시지 #{source_id})",

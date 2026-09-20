@@ -14,6 +14,7 @@ try:
         gifticon_open_link,
         is_compact_metadata_update_request,
         is_use_request,
+        mark_as_used,
         show_list,
     )
 except ModuleNotFoundError as error:
@@ -101,6 +102,96 @@ class ListVisibilityTests(unittest.TestCase):
         self.assertIsNotNone(button)
         self.assertEqual(button.text, "열기 · 1. 스타벅스 카페아메리카노")
         self.assertEqual(button.url, "https://t.me/c/1234567890/101")
+
+    def test_mark_as_used_success(self) -> None:
+        from telegram.error import BadRequest
+
+        class DummyUser:
+            full_name = "홍길동"
+            username = "hong"
+
+        class DummyReplied:
+            message_id = 101
+            reply_to_message = None
+
+        class DummyMsg:
+            from_user = DummyUser()
+            reply_to_message = DummyReplied()
+
+            def __init__(self):
+                self.replied_text = ""
+
+            async def reply_text(self, text, **kwargs):
+                self.replied_text = text
+
+        class DummyBot:
+            def __init__(self):
+                self.deleted = []
+                self.sent = []
+
+            async def delete_message(self, chat_id, message_id):
+                self.deleted.append((chat_id, message_id))
+
+            async def send_message(self, chat_id, text, **kwargs):
+                self.sent.append((chat_id, text))
+
+        class DummyContext:
+            def __init__(self):
+                self.bot = DummyBot()
+
+        item = Gifticon(101, 1, "스타벅스 카페아메리카노", "스타벅스 카페아메리카노", "available", None, None, "2026-09-14")
+        msg = DummyMsg()
+        context = DummyContext()
+
+        with patch("bot.gifticon_for_reply", new=AsyncMock(return_value=item)), \
+             patch("bot.STORE.mark_used", new=AsyncMock(return_value=True)):
+            asyncio.run(mark_as_used(msg, context))
+
+        self.assertIn("원본 메시지도 삭제했습니다", msg.replied_text)
+        self.assertEqual(context.bot.deleted, [(-1001234567890, 101)])
+
+    def test_mark_as_used_older_than_48h_error_message(self) -> None:
+        from telegram.error import BadRequest
+
+        class DummyUser:
+            full_name = "홍길동"
+            username = "hong"
+
+        class DummyReplied:
+            message_id = 101
+            reply_to_message = None
+
+        class DummyMsg:
+            from_user = DummyUser()
+            reply_to_message = DummyReplied()
+
+            def __init__(self):
+                self.replied_text = ""
+
+            async def reply_text(self, text, **kwargs):
+                self.replied_text = text
+
+        class DummyBot:
+            async def delete_message(self, chat_id, message_id):
+                raise BadRequest("Message can't be deleted")
+
+            async def send_message(self, chat_id, text, **kwargs):
+                pass
+
+        class DummyContext:
+            def __init__(self):
+                self.bot = DummyBot()
+
+        item = Gifticon(101, 1, "스타벅스 카페아메리카노", "스타벅스 카페아메리카노", "available", None, None, "2026-09-14")
+        msg = DummyMsg()
+        context = DummyContext()
+
+        with patch("bot.gifticon_for_reply", new=AsyncMock(return_value=item)), \
+             patch("bot.STORE.mark_used", new=AsyncMock(return_value=True)):
+            asyncio.run(mark_as_used(msg, context))
+
+        self.assertIn("48시간이 지난 원본 메시지는 봇이 삭제할 수 없어", msg.replied_text)
+        self.assertNotIn("봇의 관리자 권한을 확인하세요", msg.replied_text)
 
 
 if __name__ == "__main__":
