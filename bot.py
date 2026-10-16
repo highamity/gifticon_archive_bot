@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import sys
+import unicodedata
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -42,6 +43,8 @@ OCR_SEMAPHORE = asyncio.Semaphore(1)
 OCR_MAX_FILE_BYTES = 10 * 1024 * 1024
 OCR_MAX_PIXELS = 20_000_000
 OCR_MAX_DIMENSION = 2000
+OCR_UPSCALE_BELOW = 1600
+OCR_DATE_CROP_RATIO = 0.5
 OCR_TIMEOUT_SECONDS = 15
 NOTIFICATION_JOB_NAME = "daily-expiry-notice"
 # Telegram albums arrive as several updates.  Keep the complete archive
@@ -81,30 +84,74 @@ def description_for(message) -> str:
     return (message.caption or message.text or "").strip()[:500]
 
 
+def _preprocess_for_ocr(image: Image.Image, upscale: bool = True) -> Image.Image:
+    """Normalize an image for Tesseract: grayscale, upscale small inputs."""
+    if max(image.size) < OCR_UPSCALE_BELOW and upscale:
+        image = image.resize(
+            (image.width * 2, image.height * 2), Image.Resampling.LANCZOS
+        )
+    image.thumbnail((OCR_MAX_DIMENSION, OCR_MAX_DIMENSION), Image.Resampling.LANCZOS)
+    image = ImageOps.autocontrast(image, cutoff=1)
+    image = image.filter(ImageFilter.MedianFilter(3)).filter(ImageFilter.SHARPEN)
+    return image
+
+
+def _run_tesseract(image: Image.Image) -> str:
+    result = pytesseract.image_to_string(
+        image,
+        lang="kor+eng",
+        config="--oem 1 --psm 6 --dpi 300",
+        timeout=OCR_TIMEOUT_SECONDS,
+    )
+    lines = [line.strip() for line in result.splitlines() if line.strip()]
+    return "\n".join(dict.fromkeys(lines))
+
+
 def ocr_bytes(image_bytes: bytes) -> str:
     with Image.open(io.BytesIO(image_bytes)) as source:
         if source.width * source.height > OCR_MAX_PIXELS:
             raise ValueError("image is too large for OCR")
-        image = ImageOps.exif_transpose(source).convert("RGB")
-
-    # Do not upscale small images. Downscaling large images keeps OCR bounded.
-    image.thumbnail((OCR_MAX_DIMENSION, OCR_MAX_DIMENSION), Image.Resampling.LANCZOS)
-    image = ImageOps.autocontrast(image).filter(ImageFilter.SHARPEN)
-    result = pytesseract.image_to_string(
-        image,
-        lang="kor+eng",
-        config="--psm 6",
-        timeout=OCR_TIMEOUT_SECONDS,
-    )
-    lines = [line.strip() for line in result.splitlines() if line.strip()]
-    return "\n".join(dict.fromkeys(lines))[:1500]
+        image = ImageOps.exif_transpose(source).convert("L")
+        image = _preprocess_for_ocr(image)
+        try:
+            return _run_tesseract(image)[:1500]
+        finally:
+            image.close()
 
 
-def expiry_from_text(text: str) -> date | None:
-    normalized = re.sub(r"\s+", "", text)
+def ocr_date_fallback(image_bytes: bytes) -> str:
+    """Re-read the bottom area enlarged for small expiry print.
+
+    Returns "" when nothing useful is recognized. Only used when the
+    full-image pass found no expiry date, so the extra CPU cost applies
+    to misses only.
+    """
+    try:
+        with Image.open(io.BytesIO(image_bytes)) as source:
+            if source.width * source.height > OCR_MAX_PIXELS:
+                return ""
+            image = ImageOps.exif_transpose(source).convert("L")
+            _, height = image.size
+            top = int(height * (1 - OCR_DATE_CROP_RATIO))
+            image = image.crop((0, top, image.width, height))
+            # The date line is small; always enlarge this crop.
+            image = image.resize(
+                (image.width * 2, image.height * 2), Image.Resampling.LANCZOS
+            )
+            image = _preprocess_for_ocr(image, upscale=False)
+            try:
+                return _run_tesseract(image)[:500]
+            finally:
+                image.close()
+    except Exception:
+        logger.exception("Date fallback OCR failed")
+        return ""
+
+
+def _collect_expiry_dates(normalized: str) -> list[date]:
     patterns = [
         r"(?P<y>20\d{2})[.\-/년](?P<m>\d{1,2})[.\-/월](?P<d>\d{1,2})일?",
-        r"(?P<y>20\d{2})(?P<m>\d{2})(?P<d>\d{2})",
+        r"(?<!\d)(?P<y>20\d{2})(?P<m>\d{2})(?P<d>\d{2})(?!\d)",
         r"(?P<y>\d{2})[.\-/](?P<m>\d{1,2})[.\-/](?P<d>\d{1,2})",
     ]
     found: list[date] = []
@@ -117,6 +164,27 @@ def expiry_from_text(text: str) -> date | None:
                 found.append(date(year, int(match.group("m")), int(match.group("d"))))
             except ValueError:
                 continue
+    return found
+
+
+def expiry_from_text(text: str) -> date | None:
+    # NFKC folds fullwidth punctuation/digits (．～：) that OCR engines
+    # often emit into their ASCII equivalents before matching.
+    text = unicodedata.normalize("NFKC", text)
+    # Barcode/coupon numbers (long digit runs) otherwise match the
+    # compact YYYYMMDD pattern and produce bogus dates like 2000-09-03.
+    # Only spaces/dashes join a run: newlines separate a date line from
+    # a barcode line, and must not glue them into one stripped run.
+    scrubbed = re.sub(r"\d(?:[ \-]*\d){11,}", "", text)
+    normalized = re.sub(r"\s+", "", scrubbed)
+    found = _collect_expiry_dates(normalized)
+    if found:
+        return max(found)
+    # Second chance: fix common glyph confusions (O->0, I/l->1, B->8).
+    fuzzy = re.sub(r"[OoDd]", "0", normalized)
+    fuzzy = re.sub(r"[lI]", "1", fuzzy)
+    fuzzy = re.sub(r"B", "8", fuzzy)
+    found = _collect_expiry_dates(fuzzy)
     if found:
         return max(found)
     return None
@@ -213,12 +281,23 @@ def gifticon_summary(text: str, expiry: date | None = None, title: str | None = 
     merchant = ""
     product = ""
     for line in lines:
+        # OCR often inserts spaces between syllables ("사 용 처"),
+        # so retry keyword matching on the spaceless form.
+        flat = re.sub(r"\s+", "", line)
         merchant_match = re.search(r"(?:교환처|브랜드|매장)\s*[:：]?\s*(.+)", line)
         if merchant_match:
             merchant = merchant_match.group(1).strip()
+        else:
+            flat_merchant = re.sub(r".*?(교환처|사용처|브랜드|매장)[:：]?", "", flat)
+            if flat_merchant and flat_merchant != flat:
+                merchant = flat_merchant
         product_match = re.search(r"상품명\s*[:：]?\s*(.+)", line)
         if product_match:
             product = product_match.group(1).strip()
+        elif "상품명" in flat:
+            flat_product = re.sub(r".*?상품명[:：]?", "", flat)
+            if flat_product:
+                product = flat_product
 
     noise = re.compile(
         r"^(보유 쿠폰 상세|쿠폰함|쿠폰|쿠폰상세|바코드|사용 가능|혜택 내용|이용 방법|유의 사항)$"
@@ -235,15 +314,18 @@ def gifticon_summary(text: str, expiry: date | None = None, title: str | None = 
     known_brands = (
         "롯데리아", "롯데마트", "롯데마트 & 슈퍼", "CU", "GS25", "세븐일레븐",
         "메가MGC커피", "메가커피", "투썸플레이스", "스타벅스", "이마트24",
-        "파리바게뜨", "배스킨라빈스", "버거킹", "맥도날드",
+        "파리바게뜨", "배스킨라빈스", "버거킹", "맥도날드", "카카오페이",
     )
     known_brands = tuple(sorted((*CUSTOM_BRANDS, *known_brands), key=len, reverse=True))
     for candidate in candidates:
+        flat_candidate = re.sub(r"\s+", "", candidate)
         for brand in known_brands:
-            if brand in candidate:
+            flat_brand = re.sub(r"\s+", "", brand)
+            if brand in candidate or flat_brand in flat_candidate:
                 merchant = brand
-                if candidate != brand:
-                    product = candidate
+                display = candidate if brand in candidate else flat_candidate
+                if display != brand:
+                    product = display
                 break
         if merchant:
             break
@@ -286,6 +368,12 @@ async def description_for_message(message, bot) -> str:
             return "(이미지가 너무 커서 OCR을 생략했습니다)"
         async with OCR_SEMAPHORE:
             recognized = await asyncio.to_thread(ocr_bytes, image_bytes)
+        if recognized and expiry_from_text(recognized) is None:
+            async with OCR_SEMAPHORE:
+                extra = await asyncio.to_thread(ocr_date_fallback, image_bytes)
+            if extra:
+                merged = "\n".join(dict.fromkeys((recognized + "\n" + extra).splitlines()))
+                recognized = merged[:1500]
         return recognized or "(이미지 글자 인식 실패)"
     except Exception:
         logger.exception("Could not OCR message %s", message.message_id)
@@ -382,6 +470,63 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
 
 
+_RAPID_ENGINE = None
+
+
+def _rapid_engine():
+    """Lazily create the RapidOCR engine (heavy models, minutes of RAM)."""
+    global _RAPID_ENGINE
+    if _RAPID_ENGINE is None:
+        from rapidocr_onnxruntime import RapidOCR
+
+        _RAPID_ENGINE = RapidOCR()
+    return _RAPID_ENGINE
+
+
+def ocr_rapid_expiry(image_bytes: bytes) -> date | None:
+    """Last-resort expiry extraction with RapidOCR.
+
+    The bundled model cannot read Korean, so its output is used ONLY for
+    date parsing (digits read very reliably) and never merged into the
+    human-readable description. Returns None when RapidOCR is missing.
+    """
+    if len(image_bytes) > OCR_MAX_FILE_BYTES:
+        return None
+    try:
+        engine = _rapid_engine()
+    except Exception:
+        logger.exception("RapidOCR engine unavailable")
+        return None
+    try:
+        result, _ = engine(image_bytes)
+    except Exception:
+        logger.exception("RapidOCR inference failed")
+        return None
+    texts = [box[1] for box in (result or []) if len(box) > 1]
+    if not texts:
+        return None
+    return expiry_from_text("\n".join(texts))
+
+
+async def rapid_expiry_for_message(message, bot) -> date | None:
+    """Download the image again and try RapidOCR expiry extraction."""
+    file_id = None
+    if message.photo:
+        file_id = message.photo[-1].file_id
+    elif message.document and (message.document.mime_type or "").startswith("image/"):
+        file_id = message.document.file_id
+    if not file_id:
+        return None
+    try:
+        telegram_file = await bot.get_file(file_id)
+        image_bytes = bytes(await telegram_file.download_as_bytearray())
+        async with OCR_SEMAPHORE:
+            return await asyncio.to_thread(ocr_rapid_expiry, image_bytes)
+    except Exception:
+        logger.exception("Could not run RapidOCR fallback for message %s", message.message_id)
+        return None
+
+
 async def cmd_chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.effective_message
     chat = update.effective_chat
@@ -408,6 +553,12 @@ async def archive_message(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             )
             description = await description_for_message(msg, context.bot)
             expiry = expiry_from_text(description)
+            if expiry is None and (msg.photo or msg.document):
+                # Tesseract missed: RapidOCR reads digits reliably even
+                # though it cannot read Korean. Description is untouched.
+                expiry = await rapid_expiry_for_message(msg, context.bot)
+                if expiry is not None:
+                    logger.info("RapidOCR recovered expiry %s for message %s", expiry, msg.message_id)
             await STORE.add(
                 msg.message_id,
                 copied.message_id,

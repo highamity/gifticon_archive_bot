@@ -50,16 +50,22 @@
 
 ### 2.3 OCR 및 텍스트 파싱 파이프라인
 
-1. **이미지 전처리 및 OCR (`ocr_bytes`)**:
-   - PIL을 사용하여 `exif_transpose` (회전 보정), 2500px 미만인 경우 2배 확대(upscale).
-   - `autocontrast` 및 `SHARPEN` 필터 적용 후 `pytesseract` 호출.
-   - `lang="kor+eng"`, Tesseract Page Segmentation Mode `--psm 6`, `--psm 11` 병합 실행하여 텍스트 인식률 극대화.
+1. **이미지 전처리 및 OCR (`ocr_bytes`, `ocr_date_fallback`)**:
+   - PIL을 사용하여 `exif_transpose` (회전 보정) 후 그레이스케일(`L`) 변환.
+   - 최대 변이 1600px 미만이면 2배 확대(upscale), 2000px 초과분은 축소. 상한 2000만 픽셀.
+   - `autocontrast(cutoff=1)` 및 `MedianFilter(3)` + `SHARPEN` 적용 후 `pytesseract` 호출.
+   - `lang="kor+eng"`, `--oem 1 --psm 6 --dpi 300`, 이미지당 타임아웃 15초.
+   - 전체 인식에 유효기간이 없으면 하단 50% 크롭을 2배 확대해 날짜 재인식(`ocr_date_fallback`, 미인식 건에만 추가 실행).
+   - 그래도 없으면 RapidOCR 3단계 fallback(`ocr_rapid_expiry` → `rapid_expiry_for_message`, `archive_message`에서만 호출). 번들 모델은 한글 불가라 날짜 파싱에만 사용하고 description에는 합치지 않음.
 2. **유효기간 인식 (`expiry_from_text`)**:
-   - 정규식을 통해 `YYYY.MM.DD`, `YYYY-MM-DD`, `YYYY년 MM월 DD일`, `YY.MM.DD`, `YYYYMMDD` 패턴 매칭.
+   - 입력 전체에 NFKC 정규화(전각 `．～：` → ASCII) 후 처리.
+   - 같은 줄의 12자리 이상 숫자 연속(바코드·쿠폰번호)을 먼저 제거해 `YYYYMMDD` 오탐 방지. 줄바꿈은 run 결합에 사용하지 않음(날짜 줄과 바코드 줄이 붙어 지워지는 문제 방지).
+   - 정규식을 통해 `YYYY.MM.DD`, `YYYY-MM-DD`, `YYYY년 MM월 DD일`, `YY.MM.DD`, `YYYYMMDD` 패턴 매칭 (8자리 연속은 앞뒤 숫자 경계 확인).
+   - 매치 실패 시 `O/D→0`, `l/I→1`, `B→8` 치환 후 재시도.
    - 여러 날짜가 잡힐 경우 최댓값(`max(found)`)을 유효기간으로 판정.
 3. **요약 생성 (`gifticon_summary`)**:
-   - `교환처:`, `상품명:` 키워드 라인 추출.
-   - 사전 정의된 유명 브랜드 키워드(`스타벅스`, `CU`, `GS25`, `배스킨라빈스`, `투썸플레이스`, `이마트24`, `롯데리아` 등) 매칭.
+   - `교환처/사용처:`, `상품명:` 키워드 라인 추출 (음절 사이 공백이 낀 OCR 결과는 공백 제거형으로도 매칭).
+   - 사전 정의된 유명 브랜드 키워드(`스타벅스`, `CU`, `GS25`, `배스킨라빈스`, `투썸플레이스`, `이마트24`, `롯데리아`, `카카오페이` 등) 매칭 (공백 낀 인식도 매칭).
    - 노이즈 텍스트(바코드 번호, 쿠폰 유의사항 등) 필터링 후 `브랜드 · 상품명 / YYYY-MM-DD` 형식으로 포맷.
 
 ### 2.4 스케줄링 (`JobQueue`)
