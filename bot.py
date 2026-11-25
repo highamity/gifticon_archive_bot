@@ -30,7 +30,7 @@ try:
 except ImportError:
     LinkPreviewOptions = None
 from telegram.constants import ParseMode
-from telegram.error import BadRequest, TelegramError
+from telegram.error import TelegramError
 from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 
 from storage import Gifticon, GifticonStore
@@ -255,17 +255,6 @@ def gifticon_url(gifticon: Gifticon) -> str | None:
 def gifticon_open_link(gifticon: Gifticon) -> str:
     url = gifticon_url(gifticon)
     return f' <a href="{url}">열기</a>' if url else ""
-
-
-def gifticon_open_button(gifticon: Gifticon, index: int = 1) -> InlineKeyboardButton | None:
-    url = gifticon_url(gifticon)
-    if not url:
-        return None
-    summary = gifticon_label(gifticon)
-    name = summary.split(" / ", 1)[0].strip() or "기프티콘"
-    if len(name) > 22:
-        name = f"{name[:21]}…"
-    return InlineKeyboardButton(f"열기 · {index}. {name}", url=url)
 
 
 def gifticon_summary(text: str, expiry: date | None = None, title: str | None = None) -> str:
@@ -658,20 +647,6 @@ async def on_management_message(update: Update, context: ContextTypes.DEFAULT_TY
         await reset_store(msg, chat.id, argument)
 
 
-async def cmd_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    if msg and update.effective_chat and update.effective_chat.id == ACTIVE_CHAT_ID:
-        await mark_as_used(msg, context)
-    elif msg:
-        await msg.reply_text("!사용은 사용 방에서 기프티콘 원본에 답장해 실행하세요.")
-
-
-async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    if msg and update.effective_chat:
-        await restore_gifticon(msg, update.effective_chat.id, context)
-
-
 async def cmd_list(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message:
         await show_list(update.effective_message, "available")
@@ -709,39 +684,6 @@ async def cmd_expiring(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_expired(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_message:
         await show_expiring(update.effective_message, 0, include_expired=True)
-
-
-async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    msg = update.effective_message
-    chat = update.effective_chat
-    if not msg or not chat:
-        return
-    if chat.id not in {ACTIVE_CHAT_ID, ARCHIVE_CHAT_ID}:
-        return
-    replied = msg.reply_to_message
-    if replied is None:
-        await msg.reply_text("삭제할 기프티콘 메시지에 답장해서 /delete 를 입력하세요.")
-        return
-    gifticon = (
-        await STORE.get_by_archive(replied.message_id)
-        if chat.id == ARCHIVE_CHAT_ID
-        else await STORE.get_by_source(replied.message_id)
-    )
-    if gifticon is None:
-        await msg.reply_text("답장한 메시지는 보관된 기프티콘이 아닙니다.")
-        return
-    if gifticon.status != "used":
-        await msg.reply_text("안전상 사용 완료된 기프티콘만 /delete 할 수 있습니다.")
-        return
-    if not await STORE.delete(gifticon.source_message_id):
-        await msg.reply_text("DB 항목을 삭제하지 못했습니다.")
-        return
-    try:
-        await context.bot.delete_message(ARCHIVE_CHAT_ID, gifticon.archive_message_id)
-        archive_note = "이력 방 메시지도 삭제했습니다."
-    except TelegramError:
-        archive_note = "DB에서는 삭제했지만 이력 방 메시지 삭제에는 실패했습니다."
-    await msg.reply_text(f"사용 완료 기프티콘을 강제 삭제했습니다. {archive_note}")
 
 
 async def force_delete(msg, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1009,30 +951,6 @@ async def update_compact_metadata(msg, chat_id: int, raw: str) -> None:
     await msg.reply_text(f"목록 제목을 '{title}', 유효기간을 {expiry_value}으로 수정했습니다.")
 
 
-async def request_use(msg, chat_id: int) -> None:
-    if chat_id != ACTIVE_CHAT_ID:
-        await msg.reply_text("!사용은 사용 방에서 원본 기프티콘에 답장해 실행하세요.")
-        return
-    replied = msg.reply_to_message
-    if replied is None:
-        await msg.reply_text("사용할 기프티콘 메시지에 답장하여 !사용을 입력하세요.")
-        return
-    gifticon = await STORE.get_by_source(replied.message_id)
-    if gifticon is None:
-        await msg.reply_text("이 메시지는 보관된 기프티콘이 아닙니다.")
-        return
-    if gifticon.status == "used":
-        await msg.reply_text("이미 사용 처리된 기프티콘입니다.")
-        return
-    keyboard = InlineKeyboardMarkup(
-        [[
-            InlineKeyboardButton("사용 완료 및 삭제", callback_data=f"use:{gifticon.source_message_id}"),
-            InlineKeyboardButton("취소", callback_data="cancel"),
-        ]]
-    )
-    await msg.reply_text("사용 완료로 처리하고 사용 방의 원본을 삭제할까요?", reply_markup=keyboard)
-
-
 async def mark_as_used(msg, context: ContextTypes.DEFAULT_TYPE) -> None:
     replied = msg.reply_to_message
     if replied is None:
@@ -1051,24 +969,17 @@ async def mark_as_used(msg, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text("이미 처리되었거나 찾을 수 없는 기프티콘입니다.")
         return
     label = gifticon_label(gifticon)
-    try:
-        await context.bot.delete_message(ACTIVE_CHAT_ID, gifticon.source_message_id)
-        deletion = "원본 메시지도 삭제했습니다."
-    except BadRequest as error:
-        logger.warning("Failed to delete source message %s: %s", gifticon.source_message_id, error)
-        err_msg = str(error).lower()
-        if "can't be deleted" in err_msg or "message to delete not found" in err_msg:
-            deletion = "사용 처리는 완료되었습니다.\n(텔레그램 정책상 48시간이 지난 원본 메시지는 봇이 삭제할 수 없어 직접 삭제해 주셔야 합니다.)"
-        else:
-            deletion = f"사용 처리는 했지만 원본 삭제에 실패했습니다. ({error.message})"
     await context.bot.send_message(
         ARCHIVE_CHAT_ID,
         f"사용 완료: {label}\n처리자: {used_by} (원본 메시지 #{gifticon.source_message_id})",
     )
-    await msg.reply_text(f"사용 처리했습니다: {label}\n{deletion}")
+    # The original stays in the active chat: Telegram only lets a bot
+    # delete its own messages within 48h, so attempting it mostly fails.
+    await msg.reply_text(f"사용 처리했습니다: {label}")
 
 
-async def confirm_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_delete_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle the inline buttons created by show_delete_list."""
     query = update.callback_query
     if query is None or query.message is None:
         return
@@ -1079,41 +990,6 @@ async def confirm_use(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if query.data == "delete_cancel":
         await query.answer("삭제를 취소했습니다.")
         await query.edit_message_text("❌ 삭제가 취소되었습니다.")
-        return
-    if query.data and query.data.startswith("delete_confirm:"):
-        await delete_selected(update, context, int(query.data.split(":", 1)[1]))
-        return
-    if query.data == "cancel":
-        await query.edit_message_text("사용 처리를 취소했습니다.")
-        return
-    if not query.data or not query.data.startswith("use:"):
-        return
-    source_id = int(query.data.split(":", 1)[1])
-    gifticon = await STORE.get_by_source(source_id)
-    if gifticon is None:
-        await query.edit_message_text("이미 삭제되었거나 찾을 수 없는 기프티콘입니다.")
-        return
-    user = query.from_user
-    used_by = user.full_name or user.username or str(user.id)
-    if not await STORE.mark_used(source_id, used_by):
-        await query.edit_message_text("이미 처리되었거나 찾을 수 없는 기프티콘입니다.")
-        return
-    label = gifticon_label(gifticon)
-    try:
-        await context.bot.delete_message(ACTIVE_CHAT_ID, source_id)
-        deletion = "사용 방의 원본을 삭제했습니다."
-    except BadRequest as error:
-        logger.warning("Failed to delete source message %s: %s", source_id, error)
-        err_msg = str(error).lower()
-        if "can't be deleted" in err_msg or "message to delete not found" in err_msg:
-            deletion = "사용 처리는 기록되었습니다.\n(텔레그램 정책상 48시간이 지난 원본 메시지는 직접 삭제해 주셔야 합니다.)"
-        else:
-            deletion = f"사용 처리는 기록했지만 원본 삭제에 실패했습니다. ({error.message})"
-    await context.bot.send_message(
-        ARCHIVE_CHAT_ID,
-        f"사용 완료: {label}\n처리자: {used_by} (원본 메시지 #{source_id})",
-    )
-    await query.edit_message_text(f"사용 완료로 기록했습니다: {label}\n{deletion}")
 
 
 async def restore_gifticon(msg, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1290,10 +1166,6 @@ async def schedule_expiry_job(job_queue) -> None:
         logger.info("Daily expiry notification is disabled in settings.")
 
 
-async def load_expiry_job(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await schedule_expiry_job(context.application.job_queue)
-
-
 async def update_notification_settings(
     msg, chat_id: int, argument: str, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -1411,7 +1283,7 @@ def main() -> None:
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("expiring", cmd_expiring))
     app.add_handler(CommandHandler("expired", cmd_expired))
-    app.add_handler(CallbackQueryHandler(confirm_use))
+    app.add_handler(CallbackQueryHandler(handle_delete_callback))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, on_management_message), group=0)
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, archive_message), group=1)
     logger.info("Polling started for active=%s archive=%s", ACTIVE_CHAT_ID, ARCHIVE_CHAT_ID)

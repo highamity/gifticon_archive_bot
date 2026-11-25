@@ -10,7 +10,6 @@ os.environ.setdefault("GIFTICON_ARCHIVE_CHAT_ID", "-1009876543210")
 try:
     from bot import (
         Gifticon,
-        gifticon_open_button,
         gifticon_open_link,
         is_compact_metadata_update_request,
         is_use_request,
@@ -113,16 +112,7 @@ class ListVisibilityTests(unittest.TestCase):
         link = gifticon_open_link(item)
         self.assertEqual(link, ' <a href="https://t.me/c/1234567890/101">열기</a>')
 
-    def test_gifticon_open_button_format(self) -> None:
-        item = Gifticon(101, 1, "스타벅스 카페아메리카노", "스타벅스 카페아메리카노", "available", None, None, "2026-09-14")
-        button = gifticon_open_button(item, 1)
-        self.assertIsNotNone(button)
-        self.assertEqual(button.text, "열기 · 1. 스타벅스 카페아메리카노")
-        self.assertEqual(button.url, "https://t.me/c/1234567890/101")
-
     def test_mark_as_used_success(self) -> None:
-        from telegram.error import BadRequest
-
         class DummyUser:
             full_name = "홍길동"
             username = "hong"
@@ -164,50 +154,11 @@ class ListVisibilityTests(unittest.TestCase):
              patch("bot.STORE.mark_used", new=AsyncMock(return_value=True)):
             asyncio.run(mark_as_used(msg, context))
 
-        self.assertIn("원본 메시지도 삭제했습니다", msg.replied_text)
-        self.assertEqual(context.bot.deleted, [(-1001234567890, 101)])
+        self.assertIn("사용 처리했습니다", msg.replied_text)
+        # The original message is intentionally left in the active chat.
+        self.assertEqual(context.bot.deleted, [])
+        self.assertEqual(len(context.bot.sent), 1)
 
-    def test_mark_as_used_older_than_48h_error_message(self) -> None:
-        from telegram.error import BadRequest
-
-        class DummyUser:
-            full_name = "홍길동"
-            username = "hong"
-
-        class DummyReplied:
-            message_id = 101
-            reply_to_message = None
-
-        class DummyMsg:
-            from_user = DummyUser()
-            reply_to_message = DummyReplied()
-
-            def __init__(self):
-                self.replied_text = ""
-
-            async def reply_text(self, text, **kwargs):
-                self.replied_text = text
-
-        class DummyBot:
-            async def delete_message(self, chat_id, message_id):
-                raise BadRequest("Message can't be deleted")
-
-            async def send_message(self, chat_id, text, **kwargs):
-                pass
-
-        class DummyContext:
-            def __init__(self):
-                self.bot = DummyBot()
-
-        item = Gifticon(101, 1, "스타벅스 카페아메리카노", "스타벅스 카페아메리카노", "available", None, None, "2026-09-14")
-        msg = DummyMsg()
-        context = DummyContext()
-
-        with patch("bot.gifticon_for_reply", new=AsyncMock(return_value=item)), \
-             patch("bot.STORE.mark_used", new=AsyncMock(return_value=True)):
-            asyncio.run(mark_as_used(msg, context))
-
-        self.assertIn("48시간이 지난 원본 메시지는 봇이 삭제할 수 없어", msg.replied_text)
         self.assertNotIn("봇의 관리자 권한을 확인하세요", msg.replied_text)
 
 
