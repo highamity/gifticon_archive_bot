@@ -257,6 +257,12 @@ def gifticon_open_link(gifticon: Gifticon) -> str:
     return f' <a href="{url}">열기</a>' if url else ""
 
 
+def active_original_link(gifticon: Gifticon) -> str:
+    """Link to the original message in the active chat (not the archive copy)."""
+    url = telegram_message_link(ACTIVE_CHAT_ID, gifticon.source_message_id)
+    return f'<a href="{url}">원본 열기</a>' if url else ""
+
+
 def gifticon_summary(text: str, expiry: date | None = None, title: str | None = None) -> str:
     """Return a compact merchant/product summary instead of the full OCR text."""
     if title:
@@ -446,7 +452,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text(
             "기프티콘 보관 봇입니다. 사용 방에 올린 사진·파일·텍스트를 이력 방에 자동 보관합니다.\n\n"
             "사용할 기프티콘에 답장: !사용 또는 '사용'이 포함된 답장\n"
-            "이력 방의 보관본에 답장: !복구\n"
+            "사용 방 원본이나 이력 방 보관본에 답장: !복구\n"
             "!미사용 / !목록 / !검색 <단어> / !사용완료\n"
             "!임박 [일수] / !만료 / !삭제 / !사용완료삭제 확인 / !초기화 확인\n\n"
             "이력 방에서 !브랜드추가 <이름> / !브랜드목록 / !브랜드삭제 <이름>으로 자동 요약 브랜드를 관리합니다.\n\n"
@@ -969,9 +975,15 @@ async def mark_as_used(msg, context: ContextTypes.DEFAULT_TYPE) -> None:
         await msg.reply_text("이미 처리되었거나 찾을 수 없는 기프티콘입니다.")
         return
     label = gifticon_label(gifticon)
+    original_link = active_original_link(gifticon)
+    link_note = f" · {original_link}" if original_link else ""
+    # parse_mode=HTML means the OCR-derived label and the display name
+    # must be escaped; a stray "<" would otherwise fail the whole message.
     await context.bot.send_message(
         ARCHIVE_CHAT_ID,
-        f"사용 완료: {label}\n처리자: {used_by} (원본 메시지 #{gifticon.source_message_id})",
+        f"사용 완료: {html.escape(label)}\n처리자: {html.escape(used_by)}{link_note}",
+        parse_mode=ParseMode.HTML,
+        **no_preview_kwargs(),
     )
     # The original stays in the active chat: Telegram only lets a bot
     # delete its own messages within 48h, so attempting it mostly fails.
@@ -992,29 +1004,89 @@ async def handle_delete_callback(update: Update, context: ContextTypes.DEFAULT_T
         await query.edit_message_text("❌ 삭제가 취소되었습니다.")
 
 
+async def _original_message_exists(context: ContextTypes.DEFAULT_TYPE, source_id: int) -> bool:
+    """Probe the active chat for the original message without leaving a copy.
+
+    Telegram has no "get message" API for bots, so the cheapest reliable
+    check is to forward it to the archive room and delete the forward.
+    """
+    try:
+        probe = await context.bot.forward_message(
+            chat_id=ARCHIVE_CHAT_ID,
+            from_chat_id=ACTIVE_CHAT_ID,
+            message_id=source_id,
+        )
+    except TelegramError:
+        return False
+    try:
+        await context.bot.delete_message(ARCHIVE_CHAT_ID, probe.message_id)
+    except TelegramError:
+        logger.warning("Could not remove restore probe message %s", probe.message_id)
+    return True
+
+
+def _actor_name(user) -> str:
+    return (user.full_name if user else None) or (user.username if user else None) or "알 수 없음"
+
+
 async def restore_gifticon(msg, chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if chat_id != ARCHIVE_CHAT_ID:
-        await msg.reply_text("!복구는 이력 방의 보관 메시지에 답장해 실행하세요.")
+    if chat_id not in {ACTIVE_CHAT_ID, ARCHIVE_CHAT_ID}:
+        await msg.reply_text("!복구는 사용 방이나 이력 방에서 실행하세요.")
         return
     replied = msg.reply_to_message
     if replied is None:
-        await msg.reply_text("복구할 이력 메시지에 답장하여 !복구를 입력하세요.")
+        await msg.reply_text("복구할 기프티콘 메시지에 답장하여 !복구를 입력하세요.")
         return
-    gifticon = await STORE.get_by_archive(replied.message_id)
+
+    # The original now stays in the active chat, so it can be restored by
+    # replying to it directly. Replying in the archive room still works for
+    # legacy records whose original was deleted on use.
+    if chat_id == ACTIVE_CHAT_ID:
+        gifticon = await STORE.get_by_source(replied.message_id)
+    else:
+        gifticon = await STORE.get_by_archive(replied.message_id)
     if gifticon is None:
         await msg.reply_text("이 메시지는 봇이 보관한 기프티콘이 아닙니다.")
         return
-    try:
-        copied = await context.bot.copy_message(
-            chat_id=ACTIVE_CHAT_ID,
-            from_chat_id=ARCHIVE_CHAT_ID,
-            message_id=gifticon.archive_message_id,
-        )
+    if gifticon.status == "available":
+        await msg.reply_text("이미 미사용 상태입니다.")
+        return
+
+    if chat_id == ARCHIVE_CHAT_ID and not await _original_message_exists(
+        context, gifticon.source_message_id
+    ):
+        try:
+            copied = await context.bot.copy_message(
+                chat_id=ACTIVE_CHAT_ID,
+                from_chat_id=ARCHIVE_CHAT_ID,
+                message_id=gifticon.archive_message_id,
+            )
+        except TelegramError:
+            logger.exception("Could not restore archived message %s", gifticon.archive_message_id)
+            await msg.reply_text("복구에 실패했습니다. 봇의 두 채팅방 접근 권한을 확인해 주세요.")
+            return
         await STORE.restore(gifticon.source_message_id, copied.message_id)
-        await msg.reply_text("사용 방으로 복구했고 다시 미사용 상태로 표시했습니다.")
+        new_source_id = copied.message_id
+        note = "사용 방에 원본을 다시 올리고 미사용으로 표시했습니다."
+    else:
+        # Same id on both sides keeps the existing active-chat message.
+        await STORE.restore(gifticon.source_message_id, gifticon.source_message_id)
+        new_source_id = gifticon.source_message_id
+        note = "미사용으로 되돌렸습니다."
+
+    log_url = telegram_message_link(ACTIVE_CHAT_ID, new_source_id)
+    log_link = f' · <a href="{log_url}">원본 열기</a>' if log_url else ""
+    try:
+        await context.bot.send_message(
+            ARCHIVE_CHAT_ID,
+            f"복구: {html.escape(gifticon_label(gifticon))}\n"
+            f"처리자: {html.escape(_actor_name(msg.from_user))}{log_link}",
+            parse_mode=ParseMode.HTML,
+            **no_preview_kwargs(),
+        )
     except TelegramError:
-        logger.exception("Could not restore archived message %s", gifticon.archive_message_id)
-        await msg.reply_text("복구에 실패했습니다. 봇의 두 채팅방 접근 권한을 확인해 주세요.")
+        logger.exception("Could not log restore for %s", gifticon.source_message_id)
+    await msg.reply_text(note)
 
 
 async def show_list(msg, status: str | None, query: str = "") -> None:

@@ -14,6 +14,7 @@ try:
         is_compact_metadata_update_request,
         is_use_request,
         mark_as_used,
+        restore_gifticon,
         show_list,
     )
 except ModuleNotFoundError as error:
@@ -158,8 +159,153 @@ class ListVisibilityTests(unittest.TestCase):
         # The original message is intentionally left in the active chat.
         self.assertEqual(context.bot.deleted, [])
         self.assertEqual(len(context.bot.sent), 1)
+        log_text = context.bot.sent[0][1]
+        # The archive log links to the original instead of exposing its id.
+        self.assertIn('<a href="https://t.me/c/1234567890/101">원본 열기</a>', log_text)
+        self.assertNotIn("#101", log_text)
 
-        self.assertNotIn("봇의 관리자 권한을 확인하세요", msg.replied_text)
+    def test_mark_as_used_escapes_ocr_text_in_log(self) -> None:
+        class DummyUser:
+            full_name = "<홍길동>"
+            username = "hong"
+
+        class DummyMsg:
+            from_user = DummyUser()
+            reply_to_message = type("R", (), {"message_id": 101, "reply_to_message": None})()
+
+            async def reply_text(self, text, **kwargs):
+                pass
+
+        class DummyBot:
+            def __init__(self):
+                self.sent = []
+
+            async def send_message(self, chat_id, text, **kwargs):
+                self.sent.append((chat_id, text))
+
+        item = Gifticon(101, 1, "A&B <쿠폰>", "A&B <쿠폰>", "available", None, None, "2026-09-14")
+        context = type("C", (), {"bot": DummyBot()})()
+
+        with patch("bot.gifticon_for_reply", new=AsyncMock(return_value=item)), \
+             patch("bot.STORE.mark_used", new=AsyncMock(return_value=True)):
+            asyncio.run(mark_as_used(DummyMsg(), context))
+
+        log_text = context.bot.sent[0][1]
+        self.assertIn("&lt;홍길동&gt;", log_text)
+        self.assertIn("A&amp;B &lt;쿠폰&gt;", log_text)
+
+    def test_restore_from_active_original_keeps_source_message(self) -> None:
+        class DummyMsg:
+            from_user = type("U", (), {"full_name": "홍길동", "username": "hong"})()
+            reply_to_message = type("R", (), {"message_id": 101})()
+
+            def __init__(self):
+                self.replied_text = ""
+
+            async def reply_text(self, text, **kwargs):
+                self.replied_text = text
+
+        class DummyBot:
+            def __init__(self):
+                self.copied = []
+                self.sent = []
+
+            async def copy_message(self, **kwargs):
+                self.copied.append(kwargs)
+                return type("M", (), {"message_id": 555})()
+
+            async def send_message(self, chat_id, text, **kwargs):
+                self.sent.append((chat_id, text))
+
+        item = Gifticon(101, 1, "스타벅스 카페아메리카노", "스타벅스 카페아메리카노", "used", "홍길동", None, "2026-09-14")
+        context = type("C", (), {"bot": DummyBot()})()
+        restore = AsyncMock()
+        msg = DummyMsg()
+
+        with patch("bot.STORE.get_by_source", new=AsyncMock(return_value=item)), \
+             patch("bot.STORE.restore", new=restore):
+            asyncio.run(restore_gifticon(msg, -1001234567890, context))
+
+        restore.assert_awaited_once_with(101, 101)
+        self.assertEqual(context.bot.copied, [])
+        self.assertIn("미사용으로 되돌렸습니다", msg.replied_text)
+        self.assertEqual(len(context.bot.sent), 1)
+        self.assertIn("복구:", context.bot.sent[0][1])
+
+    def test_restore_from_archive_with_original_present_skips_copy(self) -> None:
+        class DummyMsg:
+            from_user = type("U", (), {"full_name": "홍길동", "username": "hong"})()
+            reply_to_message = type("R", (), {"message_id": 900})()
+
+            async def reply_text(self, text, **kwargs):
+                self.text = text
+
+        class DummyBot:
+            def __init__(self):
+                self.copied = []
+                self.deleted = []
+
+            async def forward_message(self, **kwargs):
+                return type("M", (), {"message_id": 777})()
+
+            async def delete_message(self, chat_id, message_id):
+                self.deleted.append((chat_id, message_id))
+
+            async def copy_message(self, **kwargs):
+                self.copied.append(kwargs)
+                return type("M", (), {"message_id": 555})()
+
+            async def send_message(self, chat_id, text, **kwargs):
+                pass
+
+        item = Gifticon(101, 900, "스타벅스 카페아메리카노", "스타벅스 카페아메리카노", "used", "홍길동", None, "2026-09-14")
+        context = type("C", (), {"bot": DummyBot()})()
+        restore = AsyncMock()
+
+        with patch("bot.STORE.get_by_archive", new=AsyncMock(return_value=item)), \
+             patch("bot.STORE.restore", new=restore):
+            asyncio.run(restore_gifticon(DummyMsg(), -1009876543210, context))
+
+        restore.assert_awaited_once_with(101, 101)
+        self.assertEqual(context.bot.copied, [])
+        self.assertEqual(context.bot.deleted, [(-1009876543210, 777)])
+
+    def test_restore_from_archive_without_original_copies_message(self) -> None:
+        from telegram.error import BadRequest
+
+        class DummyMsg:
+            from_user = type("U", (), {"full_name": "홍길동", "username": "hong"})()
+            reply_to_message = type("R", (), {"message_id": 900})()
+
+            async def reply_text(self, text, **kwargs):
+                self.text = text
+
+        class DummyBot:
+            def __init__(self):
+                self.copied = []
+
+            async def forward_message(self, **kwargs):
+                raise BadRequest("Message to forward not found")
+
+            async def copy_message(self, **kwargs):
+                self.copied.append(kwargs)
+                return type("M", (), {"message_id": 555})()
+
+            async def send_message(self, chat_id, text, **kwargs):
+                pass
+
+        item = Gifticon(101, 900, "스타벅스 카페아메리카노", "스타벅스 카페아메리카노", "used", "홍길동", None, "2026-09-14")
+        context = type("C", (), {"bot": DummyBot()})()
+        restore = AsyncMock()
+        msg = DummyMsg()
+
+        with patch("bot.STORE.get_by_archive", new=AsyncMock(return_value=item)), \
+             patch("bot.STORE.restore", new=restore):
+            asyncio.run(restore_gifticon(msg, -1009876543210, context))
+
+        restore.assert_awaited_once_with(101, 555)
+        self.assertEqual(context.bot.copied[0]["message_id"], 900)
+        self.assertIn("다시 올리고 미사용으로 표시했습니다", msg.text)
 
 
 if __name__ == "__main__":
