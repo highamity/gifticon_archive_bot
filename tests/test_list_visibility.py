@@ -58,6 +58,23 @@ class ListVisibilityTests(unittest.TestCase):
         self.assertIn('<a href="https://t.me/c/1234567890/2">열기</a>', message.text)
         self.assertIn('<a href="https://t.me/c/1234567890/3">열기</a>', message.text)
         self.assertNotIn("reply_markup", message.kwargs)
+        # Unused entries are the norm; no per-line "[미사용]" marker.
+        self.assertNotIn("[미사용]", message.text)
+        self.assertIn("1. current", message.text)
+
+    def test_used_list_keeps_user_marker(self) -> None:
+        records = [
+            Gifticon(4, 104, "used item", "used item", "used", "홍길동", None, "2026-09-14"),
+        ]
+
+        async def scenario() -> ReplyCapture:
+            message = ReplyCapture()
+            with patch("bot.STORE.list", new=AsyncMock(return_value=records)):
+                await show_list(message, "used")
+            return message
+
+        message = asyncio.run(scenario())
+        self.assertIn("[사용 (홍길동)] used item", message.text)
 
     def test_reply_button_command_routing(self) -> None:
         class MockMsg:

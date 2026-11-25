@@ -1158,11 +1158,17 @@ async def show_list(msg, status: str | None, query: str = "") -> None:
         return
     lines = [f"{len(records)}개 기프티콘"]
     for index, item in enumerate(records[:50], start=1):
-        state = "미사용" if item.status == "available" else f"사용 ({html.escape(item.used_by or '알 수 없음')})"
+        # Unused entries are the common case, so no per-line status prefix.
+        # Only used entries need a marker, carrying who used them.
+        marker = (
+            ""
+            if item.status == "available"
+            else f"[사용 ({html.escape(item.used_by or '알 수 없음')})] "
+        )
         expiry = gifticon_expiry(item)
         summary = html.escape(gifticon_summary(item.description, expiry, item.title))
         open_link = gifticon_open_link(item)
-        lines.append(f"{index}. [{state}] {summary}{open_link}")
+        lines.append(f"{index}. {marker}{summary}{open_link}")
     if len(records) > 50:
         lines.append(f"… 나머지 {len(records) - 50}개는 검색으로 좁혀 보세요.")
     await msg.reply_text(
