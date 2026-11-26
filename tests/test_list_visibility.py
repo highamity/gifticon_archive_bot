@@ -308,5 +308,58 @@ class ListVisibilityTests(unittest.TestCase):
         self.assertIn("다시 올리고 미사용으로 표시했습니다", msg.text)
 
 
+    def test_expiry_sort_puts_unknown_expiry_last(self) -> None:
+        records = [
+            Gifticon(1, 101, "later", "later", "available", None, None, "2026-10-01"),
+            Gifticon(2, 102, "sooner", "sooner", "available", None, None, "2026-09-01"),
+            Gifticon(3, 103, "unknown", "unknown", "available", None, None, None),
+        ]
+
+        async def scenario() -> ReplyCapture:
+            message = ReplyCapture()
+            with (
+                patch("bot.STORE.list", new=AsyncMock(return_value=records)),
+                patch("bot.kst_today", return_value=date(2026, 8, 1)),
+            ):
+                await show_list(message, "available", sort_by="expiry")
+            return message
+
+        message = asyncio.run(scenario())
+        text = message.text
+        self.assertIn("1. sooner", text)
+        self.assertIn("2. later", text)
+        self.assertIn("3. unknown", text)
+        sooner_idx = text.index("1. sooner")
+        later_idx = text.index("2. later")
+        unknown_idx = text.index("3. unknown")
+        self.assertLess(sooner_idx, later_idx)
+        self.assertLess(later_idx, unknown_idx)
+
+    def test_name_sort_alphabetical(self) -> None:
+        # 가나다순: 가온 < 나래 < 다솜
+        records = [
+            Gifticon(1, 101, "나래마트 3천원권", "나래마트 3천원권", "available", None, None, "2026-10-01"),
+            Gifticon(2, 102, "가온카페 아메리카노", "가온카페 아메리카노", "available", None, None, "2026-09-01"),
+            Gifticon(3, 103, "다솜베이커리 세트", "다솜베이커리 세트", "available", None, None, None),
+        ]
+
+        async def scenario() -> ReplyCapture:
+            message = ReplyCapture()
+            with (
+                patch("bot.STORE.list", new=AsyncMock(return_value=records)),
+                patch("bot.kst_today", return_value=date(2026, 8, 1)),
+            ):
+                await show_list(message, "available", sort_by="name")
+            return message
+
+        message = asyncio.run(scenario())
+        text = message.text
+        self.assertIn("1. 가온카페", text)
+        self.assertIn("2. 나래마트", text)
+        self.assertIn("3. 다솜베이커리", text)
+        self.assertLess(text.index("1. 가온카페"), text.index("2. 나래마트"))
+        self.assertLess(text.index("2. 나래마트"), text.index("3. 다솜베이커리"))
+
+
 if __name__ == "__main__":
     unittest.main()

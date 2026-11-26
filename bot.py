@@ -56,7 +56,7 @@ DEFAULT_DB = Path(__file__).resolve().parent / "gifticons.db"
 STORE = GifticonStore(Path(os.environ.get("GIFTICON_DB_PATH", str(DEFAULT_DB))))
 CUSTOM_BRANDS = set(STORE.list_brands_sync())
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [[KeyboardButton("!미사용"), KeyboardButton("!임박"), KeyboardButton("!삭제")]],
+    [[KeyboardButton("!미사용"), KeyboardButton("!유효기간순"), KeyboardButton("!이름순")]],
     resize_keyboard=True,
     is_persistent=True,
 )
@@ -453,7 +453,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "기프티콘 보관 봇입니다. 사용 방에 올린 사진·파일·텍스트를 이력 방에 자동 보관합니다.\n\n"
             "사용할 기프티콘에 답장: !사용 또는 '사용'이 포함된 답장\n"
             "사용 방 원본이나 이력 방 보관본에 답장: !복구\n"
-            "!미사용 / !목록 / !검색 <단어> / !사용완료\n"
+            "!미사용 / !유효기간순 / !이름순 / !목록 / !검색 <단어> / !사용완료\n"
             "!임박 [일수] / !만료 / !삭제 / !사용완료삭제 확인 / !초기화 확인\n\n"
             "이력 방에서 !브랜드추가 <이름> / !브랜드목록 / !브랜드삭제 <이름>으로 자동 요약 브랜드를 관리합니다.\n\n"
             "목록·검색·임박 알림의 '열기' 링크를 누르면 원본 메시지로 이동합니다.\n"
@@ -613,7 +613,11 @@ async def on_management_message(update: Update, context: ContextTypes.DEFAULT_TY
     elif command == "!복구":
         await restore_gifticon(msg, chat.id, context)
     elif command in {"!목록", "!미사용"}:
-        await show_list(msg, "available")
+        await show_list(msg, "available", sort_by="created")
+    elif command == "!유효기간순":
+        await show_list(msg, "available", sort_by="expiry")
+    elif command == "!이름순":
+        await show_list(msg, "available", sort_by="name")
     elif command == "!사용완료":
         await show_list(msg, "used")
     elif command == "!사용완료삭제":
@@ -1089,7 +1093,7 @@ async def restore_gifticon(msg, chat_id: int, context: ContextTypes.DEFAULT_TYPE
     await msg.reply_text(note)
 
 
-async def show_list(msg, status: str | None, query: str = "") -> None:
+async def show_list(msg, status: str | None, query: str = "", sort_by: str = "created") -> None:
     status = status or "available"
     records = await STORE.list(status=status, query=query)
     # The normal unused list and search should only contain usable gifticons.
@@ -1101,6 +1105,23 @@ async def show_list(msg, status: str | None, query: str = "") -> None:
             for item in records
             if (expiry := gifticon_expiry(item)) is None or expiry >= today
         ]
+    if sort_by == "expiry":
+        # 유효기간 오름차순. 유효기간이 인식되지 않은 항목은 맨 뒤로 보낸다.
+        records.sort(
+            key=lambda item: (
+                gifticon_expiry(item) is None,
+                gifticon_expiry(item) or date.max,
+            )
+        )
+    elif sort_by == "name":
+        # 표시되는 요약 문자열 기준 오름차순 (가나다순).
+        # 목록에 보이는 값과 정렬 기준을 일치시켜 혼란을 막는다.
+        records.sort(
+            key=lambda item: gifticon_summary(
+                item.description, gifticon_expiry(item), item.title
+            ).lower()
+        )
+    # "created"는 storage에서 이미 created_at DESC로 정렬되어 온다.
     if not records:
         await msg.reply_text("조건에 맞는 기프티콘이 없습니다.")
         return
